@@ -6,20 +6,23 @@ A Python command-line client for testing SIPREC (RFC 7865) servers using TLS,
 including SRTP media streaming from a 2-channel audio file using SDES keys
 parsed from the server's SDP answer. Uses 'pylibsrtp'.
 
-(Manual multipart body construction, no email library for INVITE body)
+Allows selection of SRTP encryption profile or disabling encryption (plain RTP).
+
+Relies on 'soundfile' library for reliable G.711 (PCMA/PCMU) encoding.
 
 This script:
 1. Establishes a TLS connection to a SIPREC SRS.
 2. Optionally sends OPTIONS pings.
-3. Sends a SIP INVITE with SDP offer (including client crypto attributes).
+3. Sends a SIP INVITE with SDP offer (including client crypto attributes or offering plain RTP).
 4. Handles the SIP response (1xx, 2xx).
 5. If INVITE succeeds (2xx), sends an ACK.
 6. Parses the server's SDP answer (from 200 OK) to get destination RTP IP/ports
-   and the SRTP SDES keys the server expects the client to use.
-7. If an audio file is provided, starts two threads for SRTP streaming.
-8. Waits for streaming to finish (file end or specified duration) or Ctrl+C.
-9. **Attempts to send a SIP BYE request if the INVITE was successful.**
-10. Closes the connection.
+   and potentially the SRTP SDES keys the server expects (if SAVP is negotiated).
+7. If an audio file is provided, starts two threads for RTP/SRTP streaming based on negotiation.
+8. Optionally saves the encoded audio payload (PCMA/PCMU) for each stream to separate files.
+9. Waits for streaming to finish (file end or specified duration) or Ctrl+C.
+10. Attempts to send a SIP BYE request if the INVITE was successful.
+11. Closes the connection.
 
 Requires: pylibsrtp, soundfile, numpy
   pip install pylibsrtp soundfile numpy
@@ -36,7 +39,7 @@ Default Capture Filters (based on common Google Telephony integration):
 - Media (RTP): UDP traffic to/from 74.125.39.0/24 (any UDP port).
 These can be overridden using --capture-sip-range/--port and --capture-media-range.
 
-Example Usage (Streaming with Default Capture and BYE):
+Example Usage (Streaming SRTP with Default Cipher, Capture, BYE, and Saving Streams):
   # Ensure audio.wav is a 2-channel, 8000 Hz WAV file for PCMA/PCMU
   export SSLKEYLOGFILE=/tmp/sslkeys.log # For Wireshark decryption
   python siprec_client_streamer_pylibsrtp.py \\
@@ -48,7 +51,20 @@ Example Usage (Streaming with Default Capture and BYE):
       --ca-file ca.crt \\
       --audio-file /path/to/audio.wav \\
       --stream-duration 30 \\
-      --pcap-file /tmp/siprec_capture.pcapng
+      --pcap-file /tmp/siprec_capture.pcapng \\
+      --save-stream1-file /tmp/stream1_caller.pcma \\
+      --save-stream2-file /tmp/stream2_callee.pcma
+
+Example Usage (Streaming Plain RTP, No Encryption):
+  python siprec_client_streamer_pylibsrtp.py \\
+      rec-target@domain srs.domain.tld \\
+      --src-number client@client.domain.tld \\
+      --src-host 1.2.3.4 \\
+      --cert-file client.crt \\
+      --key-file client.key \\
+      --ca-file ca.crt \\
+      --audio-file /path/to/audio.wav \\
+      --srtp-encryption NONE
 """
 
 import argparse
@@ -68,6 +84,8 @@ import threading
 import time
 import uuid
 from collections import namedtuple # Use standard collections for NamedTuple
+import io # Needed for file type hint and soundfile encoding
+from typing import Optional, Dict, List, Tuple, Union, Any # Added Optional for typing
 
 # --- 3rd Party Libs ---
 try:
@@ -92,12 +110,12 @@ except ImportError:
 SdpMediaInfo = namedtuple("SdpMediaInfo", [
     "media_type", # str: e.g., "audio"
     "port",       # int
-    "protocol",   # str: e.g., "RTP/SAVP"
+    "protocol",   # str: e.g., "RTP/SAVP" or "RTP/AVP"
     "payload_types", # list[int]
     "connection_ip", # Optional[str]
     "label",         # Optional[str]
-    "crypto_suite",  # Optional[str]
-    "crypto_key_material", # Optional[bytes]
+    "crypto_suite",  # Optional[str] (Only relevant if protocol is RTP/SAVP)
+    "crypto_key_material", # Optional[bytes] (Only relevant if protocol is RTP/SAVP)
     "rtpmap" # dict[int, tuple[str, int]] : {pt: (encoding_name, rate)}
     ]
 )
@@ -109,7 +127,7 @@ SIP_VERSION: str = "SIP/2.0"
 DEFAULT_SIPS_PORT: int = 5061
 DEFAULT_MAX_FORWARDS: int = 70
 VIA_BRANCH_PREFIX: str = "z9hG4bK"
-USER_AGENT: str = "PythonSIPRECStreamer/2.3" # Version number updated
+USER_AGENT: str = "PythonSIPRECStreamer/2.6-sf" # Version number updated
 DEFAULT_SDP_AUDIO_PORT_BASE: int = 16000 # Local port base for *offering*
 CRLF: str = "\r\n"
 CRLF_BYTES: bytes = b"\r\n"
@@ -126,6 +144,9 @@ SUPPORTED_SRTP_CIPHERS_SDES = [
     "AES_CM_128_HMAC_SHA1_80",
     "AES_CM_128_HMAC_SHA1_32",
 ]
+# Add NONE as a special value for the choice
+SRTP_ENCRYPTION_CHOICES = SUPPORTED_SRTP_CIPHERS_SDES + ["NONE"]
+DEFAULT_SRTP_ENCRYPTION = "AES_CM_128_HMAC_SHA1_80"
 
 # Mapping from common audio encoding names (uppercase) to RTP payload types
 AUDIO_ENCODING_TO_PAYLOAD_TYPE: dict[str, int] = {
@@ -144,49 +165,79 @@ DEFAULT_CAPTURE_MEDIA_RANGE = "74.125.39.0/24"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("siprec_streamer")
 logger.setLevel(logging.INFO)
+encoder_logger = logging.getLogger("siprec_streamer.encoder") # Specific logger for encoding
 
-# --- G.711 Standard Calculation ---
-BIAS = 0x84
-def linear16_to_ulaw(samples: np.ndarray) -> bytes:
-    """ Convert linear 16-bit PCM samples (numpy array) to mu-law bytes. """
+# --- Reliable G.711 Encoding using soundfile (Unchanged) ---
+
+def encode_audio_segment(samples: np.ndarray, codec_name: str, sample_rate: int) -> bytes:
+    """
+    Encodes linear 16-bit PCM samples to the specified codec (PCMA/ALAW, PCMU/ULAW)
+    using the soundfile library.
+
+    Args:
+        samples: NumPy array of dtype int16 audio samples.
+        codec_name: The target codec name ("PCMA" or "PCMU").
+        sample_rate: The audio sample rate (e.g., 8000).
+
+    Returns:
+        Bytes representing the encoded audio payload (header-less).
+
+    Raises:
+        ValueError: If the codec_name is unsupported or samples invalid.
+        sf.SoundFileError: If soundfile encounters an encoding error.
+        TypeError: If input samples cannot be converted to int16.
+    """
     if samples.dtype != np.int16:
-        samples = (samples * 32767).astype(np.int16)
-    samples_int32 = samples.astype(np.int32)
-    sign = (samples_int32 < 0)
-    magnitude = np.abs(samples_int32)
-    magnitude += BIAS
-    magnitude = np.clip(magnitude, 0, 0x7FFF)
-    exponent = np.zeros_like(magnitude, dtype=np.uint8)
-    thresholds = [32635, 16383, 8191, 4095, 2047, 1023, 511, 255]
-    for i, threshold in enumerate(thresholds):
-        exponent[magnitude <= threshold] = 7 - i
-    mantissa = (magnitude >> (exponent + 3)) & 0x0F
-    ulaw_byte = ~( (sign.astype(np.uint8) << 7) | (exponent << 4) | mantissa )
-    return ulaw_byte.astype(np.uint8).tobytes()
+        # Ensure input is int16, similar to the Dialogflow example's robustness
+        try:
+            if np.issubdtype(samples.dtype, np.floating):
+                encoder_logger.debug("Input samples were float, scaling to int16 for encoding.")
+                samples = (samples * 32767).astype(np.int16)
+            else:
+                encoder_logger.warning(f"Input samples were {samples.dtype}, attempting conversion to int16 for encoding.")
+                samples = samples.astype(np.int16)
+        except ValueError:
+            encoder_logger.error("Input samples could not be converted to int16 for encoding.")
+            raise TypeError("Input samples must be convertible to int16")
+        except Exception as conv_err:
+            encoder_logger.error(f"Unexpected error converting samples to int16: {conv_err}")
+            raise TypeError(f"Could not convert samples to int16: {conv_err}")
 
-def linear16_to_alaw(samples: np.ndarray) -> bytes:
-    """ Convert linear 16-bit PCM samples (numpy array) to A-law bytes. """
-    if samples.dtype != np.int16:
-        samples = (samples * 32767).astype(np.int16)
-    samples_int32 = samples.astype(np.int32)
-    sign = (samples_int32 < 0)
-    magnitude = np.abs(samples_int32)
-    exponent = np.ones_like(magnitude, dtype=np.uint8)
-    threshold = 32
-    exponent[magnitude < threshold] = 0
-    if np.any(magnitude >= threshold):
-        shifted_magnitude = magnitude[magnitude >= threshold] >> 4
-        exponent[magnitude >= threshold] = np.floor(np.log2(shifted_magnitude + 1e-9)).astype(np.uint8) + 1
-        exponent = np.clip(exponent, 1, 7)
-    mantissa = np.zeros_like(magnitude, dtype=np.uint8)
-    mantissa[exponent == 0] = (magnitude[exponent == 0] >> 1) & 0x0F
-    mantissa[exponent > 0] = (magnitude[exponent > 0] >> (exponent[exponent > 0] + 3)) & 0x0F
-    alaw_byte = (sign.astype(np.uint8) << 7) | (exponent << 4) | mantissa
-    alaw_byte ^= 0x55
-    return alaw_byte.astype(np.uint8).tobytes()
+    codec_name_upper = codec_name.upper()
+    # For RTP payload, we need header-less raw format
+    audio_format = "RAW"
+    subtype = None
+
+    if codec_name_upper == "PCMA" or codec_name_upper == "G711A":
+        subtype = "ALAW"
+    elif codec_name_upper == "PCMU" or codec_name_upper == "G711U":
+        subtype = "ULAW"
+    else:
+        encoder_logger.error(f"Unsupported codec for soundfile encoding: {codec_name}")
+        raise ValueError(f"Unsupported codec for encoding: {codec_name}")
+
+    # Check format/subtype validity with soundfile
+    if not sf.check_format(audio_format, subtype):
+         encoder_logger.error(f"Soundfile library does not support format='{audio_format}', subtype='{subtype}' combination.")
+         raise ValueError(f"Invalid soundfile format/subtype combination: {audio_format}/{subtype}")
+
+    # Use an in-memory buffer to write the encoded data
+    buffer = io.BytesIO()
+    try:
+        sf.write(buffer, samples, sample_rate, format=audio_format, subtype=subtype)
+        encoded_data = buffer.getvalue()
+        # Optional: log encoded size for debugging
+        # encoder_logger.debug(f"Encoded {len(samples)} samples to {len(encoded_data)} bytes using {codec_name}")
+        return encoded_data
+    except sf.SoundFileError as e:
+        encoder_logger.error(f"Soundfile error encoding to {codec_name} ({audio_format}/{subtype}): {e}")
+        raise # Re-raise the specific soundfile error
+    except Exception as e:
+        encoder_logger.exception(f"Unexpected error during soundfile encoding: {e}")
+        raise # Re-raise other unexpected errors
 
 
-# --- Helper Functions ---
+# --- Helper Functions (Mostly Unchanged, except create_sdp_offer) ---
 
 def generate_branch() -> str:
     """Generates a unique Via branch parameter."""
@@ -216,9 +267,18 @@ def get_ip_by_name(hostname: str) -> str:
         logger.error(f"Unexpected error resolving hostname '{hostname}': {e}")
         raise ValueError(f"Unexpected error resolving {hostname}") from e
 
-def create_sdp_offer(local_ip: str, local_port_base: int, audio_encoding_str: str, packet_time_ms: int) -> str:
-    """Creates the initial SDP OFFER (client's view)."""
-    # ... (SDP creation logic remains the same)
+def create_sdp_offer(
+        local_ip: str,
+        local_port_base: int,
+        audio_encoding_str: str,
+        packet_time_ms: int,
+        srtp_encryption_choice: str # NEW Parameter
+        ) -> str:
+    """
+    Creates the initial SDP OFFER (client's view).
+    Includes crypto attributes based on srtp_encryption_choice.
+    Uses RTP/SAVP if encryption is chosen, RTP/AVP otherwise.
+    """
     encoding_name = ""
     sample_rate = 0
     payload_type = None
@@ -236,45 +296,70 @@ def create_sdp_offer(local_ip: str, local_port_base: int, audio_encoding_str: st
         sample_rate = int(audio_encoding_str.split('/')[1])
         payload_type = AUDIO_ENCODING_TO_PAYLOAD_TYPE.get(encoding_name, 8) # Default to PCMA
 
+    # Determine protocol and crypto line based on user choice
+    offer_crypto_line: Optional[str] = None
+    sdp_protocol: str = "RTP/AVP" # Default to no encryption
+
+    if srtp_encryption_choice.upper() != "NONE":
+        if srtp_encryption_choice not in SUPPORTED_SRTP_CIPHERS_SDES:
+            logger.error(f"Unsupported SRTP encryption choice '{srtp_encryption_choice}'. Supported: {SUPPORTED_SRTP_CIPHERS_SDES}. Aborting SDP generation.")
+            raise ValueError(f"Unsupported SRTP encryption choice: {srtp_encryption_choice}")
+
+        sdp_protocol = "RTP/SAVP" # Secure RTP
+        random_key_salt = base64.b64encode(os.urandom(30)).decode('ascii') # 16 byte key + 14 byte salt
+        # Crypto line format: tag, cipher_suite, key_params (inline:key|salt[|lifetime][|MKI:index:length])
+        offer_crypto_line = f"a=crypto:1 {srtp_encryption_choice} inline:{random_key_salt}"
+        logger.info(f"Offering SRTP with encryption: {srtp_encryption_choice} (Protocol: {sdp_protocol})")
+    else:
+        logger.info(f"Offering plain RTP (No encryption) (Protocol: {sdp_protocol})")
+
     logger.info(f"Creating SDP Offer with: {encoding_name}/{sample_rate} (Payload Type: {payload_type}), DTMF PT: {DTMF_PAYLOAD_TYPE}, PTime: {packet_time_ms}ms")
 
-    random_key_salt = base64.b64encode(os.urandom(30)).decode('ascii')
-    offer_crypto_line = f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{random_key_salt}"
+    sdp_lines = [
+        "v=0",
+        f"o=PythonSIPClient {int(time.time())} {int(time.time())+1} IN IP4 {local_ip}",
+        "s=SIPREC Test Call Stream",
+        "t=0 0",
+        # --- Media Stream 1 (Label 1) ---
+        f"m=audio {local_port_base} {sdp_protocol} {payload_type} {DTMF_PAYLOAD_TYPE}",
+        f"c=IN IP4 {local_ip}",
+        "a=label:1",
+    ]
+    if offer_crypto_line:
+        sdp_lines.append(offer_crypto_line)
+    sdp_lines.extend([
+        f"a=rtpmap:{payload_type} {encoding_name}/{sample_rate}",
+        f"a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}",
+        f"a=fmtp:{DTMF_PAYLOAD_TYPE} 0-15",
+        "a=sendonly",
+        f"a=maxptime:{packet_time_ms}",
+        # --- Media Stream 2 (Label 2) ---
+        f"m=audio {local_port_base+2} {sdp_protocol} {payload_type} {DTMF_PAYLOAD_TYPE}",
+        f"c=IN IP4 {local_ip}",
+        "a=label:2",
+    ])
+    if offer_crypto_line:
+        sdp_lines.append(offer_crypto_line)
+    sdp_lines.extend([
+        f"a=rtpmap:{payload_type} {encoding_name}/{sample_rate}",
+        f"a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}",
+        f"a=fmtp:{DTMF_PAYLOAD_TYPE} 0-15",
+        "a=sendonly",
+        f"a=maxptime:{packet_time_ms}",
+        "" # Add trailing empty line before joining
+    ])
 
-    sdp = f"""v=0
-o=PythonSIPClient {int(time.time())} {int(time.time())+1} IN IP4 {local_ip}
-s=SIPREC Test Call Stream
-t=0 0
-m=audio {local_port_base} RTP/SAVP {payload_type} {DTMF_PAYLOAD_TYPE}
-c=IN IP4 {local_ip}
-a=label:1
-{offer_crypto_line}
-a=rtpmap:{payload_type} {encoding_name}/{sample_rate}
-a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}
-a=fmtp:{DTMF_PAYLOAD_TYPE} 0-15
-a=sendonly
-a=maxptime:{packet_time_ms}
-m=audio {local_port_base+2} RTP/SAVP {payload_type} {DTMF_PAYLOAD_TYPE}
-c=IN IP4 {local_ip}
-a=label:2
-{offer_crypto_line}
-a=rtpmap:{payload_type} {encoding_name}/{sample_rate}
-a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}
-a=fmtp:{DTMF_PAYLOAD_TYPE} 0-15
-a=sendonly
-a=maxptime:{packet_time_ms}
-"""
-    return sdp.replace('\r\n', '\n').replace('\n', CRLF)
+    return CRLF.join(sdp_lines)
 
 
-def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
+def parse_sdp_answer(sdp_body: bytes) -> List[SdpMediaInfo]:
     """
     Parses the SDP answer (from 200 OK) to extract media line details.
+    Handles both RTP/AVP and RTP/SAVP protocols.
     """
-    # ... (SDP parsing logic remains the same)
-    media_info_list: list[SdpMediaInfo] = []
-    global_ip: str | None = None
-    current_media_dict: dict | None = None
+    media_info_list: List[SdpMediaInfo] = []
+    global_ip: Optional[str] = None
+    current_media_dict: Optional[Dict[str, Any]] = None
 
     try:
         sdp_str = sdp_body.decode('utf-8', errors='ignore')
@@ -285,89 +370,107 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
             if line.startswith("c=IN IP4 "):
                 global_ip = line.split()[-1]
                 logger.debug(f"SDP Answer: Found global connection IP: {global_ip}")
-                break
+                break # Assume first c= line is session level
 
         for line in lines:
             line = line.strip()
             if line.startswith("m="):
+                # Finalize the previous media description before starting a new one
                 if current_media_dict:
                      try:
+                         # Ensure rtpmap exists, even if empty
                          current_media_dict.setdefault("rtpmap", {})
                          media_info_list.append(SdpMediaInfo(**current_media_dict))
                      except TypeError as te:
                           logger.error(f"Failed to finalize SdpMediaInfo: {te}. Data: {current_media_dict}")
-                     current_media_dict = None
+                     current_media_dict = None # Reset for the new m= line
 
                 parts = line.split()
                 if len(parts) >= 4 and parts[0] == "m=audio":
                     try:
+                        protocol = parts[2]
+                        # Basic validation of protocol format
+                        if protocol not in ["RTP/AVP", "RTP/SAVP"]:
+                            logger.warning(f"SDP Answer: Unexpected media protocol '{protocol}' in m= line: {line}. Skipping.")
+                            continue # Skip this m= line
+
                         current_media_dict = {
                             "media_type": parts[0][2:],
                             "port": int(parts[1]),
-                            "protocol": parts[2],
+                            "protocol": protocol,
                             "payload_types": [int(pt) for pt in parts[3:] if pt.isdigit()],
-                            "connection_ip": global_ip,
+                            "connection_ip": global_ip, # Start with global IP, override if c= line follows
                             "label": None,
-                            "crypto_suite": None,
+                            "crypto_suite": None, # Will be populated only if SAVP and a=crypto exists
                             "crypto_key_material": None,
                             "rtpmap": {}
                         }
                         logger.debug(f"SDP Answer: Found m= line: Port={current_media_dict['port']}, Proto={current_media_dict['protocol']}, PTs={current_media_dict['payload_types']}")
-                    except ValueError:
+                    except (ValueError, IndexError):
                         logger.warning(f"SDP Answer: Could not parse m= line details: {line}")
                         current_media_dict = None
                 else:
+                    # Not an audio media line we are interested in, or malformed
                     current_media_dict = None
 
-            elif current_media_dict and line.startswith("c=IN IP4 "):
-                current_media_dict["connection_ip"] = line.split()[-1]
-                logger.debug(f"SDP Answer: Found media-specific IP for port {current_media_dict['port']}: {current_media_dict['connection_ip']}")
+            # Only process attributes if we have a current valid media description
+            elif current_media_dict:
+                if line.startswith("c=IN IP4 "):
+                    current_media_dict["connection_ip"] = line.split()[-1]
+                    logger.debug(f"SDP Answer: Found media-specific IP for port {current_media_dict['port']}: {current_media_dict['connection_ip']}")
 
-            elif current_media_dict and line.startswith("a=label:"):
-                 current_media_dict["label"] = line.split(":", 1)[1]
-                 logger.debug(f"SDP Answer: Found label for port {current_media_dict['port']}: {current_media_dict['label']}")
+                elif line.startswith("a=label:"):
+                     current_media_dict["label"] = line.split(":", 1)[1].strip()
+                     logger.debug(f"SDP Answer: Found label for port {current_media_dict['port']}: {current_media_dict['label']}")
 
-            elif current_media_dict and line.startswith("a=rtpmap:"):
-                 try:
-                      rtpmap_parts = line.split(":", 1)[1].split(maxsplit=1)
-                      pt = int(rtpmap_parts[0])
-                      name_rate_parts = rtpmap_parts[1].split('/')
-                      name = name_rate_parts[0]
-                      rate = int(name_rate_parts[1])
-                      if pt in current_media_dict["payload_types"]:
-                            current_media_dict["rtpmap"][pt] = (name, rate)
-                            logger.debug(f"SDP Answer: Found rtpmap for port {current_media_dict['port']}: PT={pt}, Name={name}, Rate={rate}")
-                 except (ValueError, IndexError):
-                      logger.warning(f"SDP Answer: Could not parse rtpmap line: {line}")
+                elif line.startswith("a=rtpmap:"):
+                     try:
+                          rtpmap_parts = line.split(":", 1)[1].split(maxsplit=1)
+                          pt = int(rtpmap_parts[0])
+                          name_rate_parts = rtpmap_parts[1].split('/')
+                          name = name_rate_parts[0]
+                          rate = int(name_rate_parts[1])
+                          if pt in current_media_dict["payload_types"]:
+                                current_media_dict["rtpmap"][pt] = (name, rate)
+                                logger.debug(f"SDP Answer: Found rtpmap for port {current_media_dict['port']}: PT={pt}, Name={name}, Rate={rate}")
+                     except (ValueError, IndexError, TypeError):
+                          logger.warning(f"SDP Answer: Could not parse rtpmap line: {line}")
 
+                elif line.startswith("a=crypto:") and current_media_dict["protocol"] == "RTP/SAVP":
+                    # Only parse crypto if the protocol is SAVP
+                    crypto_parts = line.split()
+                    if len(crypto_parts) >= 3 and crypto_parts[2].startswith("inline:"):
+                        tag = crypto_parts[0].split(':')[1]
+                        suite = crypto_parts[1]
+                        key_b64 = crypto_parts[2].split(':', 1)[1]
 
-            elif current_media_dict and line.startswith("a=crypto:"):
-                crypto_parts = line.split()
-                if len(crypto_parts) >= 3 and crypto_parts[2].startswith("inline:"):
-                    tag = crypto_parts[0].split(':')[1]
-                    suite = crypto_parts[1]
-                    key_b64 = crypto_parts[2].split(':', 1)[1]
-
-                    if suite in SUPPORTED_SRTP_CIPHERS_SDES:
-                        try:
-                            key_material = base64.b64decode(key_b64)
-                            expected_len = 30
-                            if len(key_material) == expected_len:
-                                if current_media_dict["crypto_suite"] is None:
-                                    current_media_dict["crypto_suite"] = suite
-                                    current_media_dict["crypto_key_material"] = key_material
-                                    logger.info(f"SDP Answer: Parsed valid crypto for port {current_media_dict['port']} (Tag:{tag}): Suite={suite}, KeyLen={len(key_material)}")
+                        # Check if the suite offered by server is one we support
+                        if suite in SUPPORTED_SRTP_CIPHERS_SDES:
+                            try:
+                                key_material = base64.b64decode(key_b64)
+                                # Basic length check (AES_CM_128 needs 16 key + 14 salt = 30 bytes)
+                                expected_len = 30
+                                if len(key_material) == expected_len:
+                                    # Store the first valid crypto line found for this media stream
+                                    if current_media_dict.get("crypto_suite") is None:
+                                        current_media_dict["crypto_suite"] = suite
+                                        current_media_dict["crypto_key_material"] = key_material
+                                        logger.info(f"SDP Answer: Parsed valid crypto for port {current_media_dict['port']} (Tag:{tag}): Suite={suite}, KeyLen={len(key_material)}")
+                                    else:
+                                         logger.debug(f"SDP Answer: Ignoring additional crypto line for port {current_media_dict['port']} (already have one).")
                                 else:
-                                     logger.debug(f"SDP Answer: Ignoring additional crypto line for port {current_media_dict['port']} (already have one).")
-                            else:
-                                logger.warning(f"SDP Answer: Crypto key material length mismatch for port {current_media_dict['port']}, suite {suite}. Expected {expected_len}, got {len(key_material)}. Line: {line}")
-                        except (base64.binascii.Error, ValueError) as e:
-                            logger.warning(f"SDP Answer: Error decoding base64 key material for port {current_media_dict['port']}: {e}. Line: {line}")
+                                    logger.warning(f"SDP Answer: Crypto key material length mismatch for port {current_media_dict['port']}, suite {suite}. Expected {expected_len}, got {len(key_material)}. Line: {line}")
+                            except (base64.binascii.Error, ValueError) as e:
+                                logger.warning(f"SDP Answer: Error decoding base64 key material for port {current_media_dict['port']}: {e}. Line: {line}")
+                        else:
+                             logger.warning(f"SDP Answer: Server offered unsupported crypto suite for port {current_media_dict['port']}: {suite}. Line: {line}")
                     else:
-                         logger.warning(f"SDP Answer: Unsupported crypto suite for port {current_media_dict['port']}: {suite}. Line: {line}")
-                else:
-                    logger.warning(f"SDP Answer: Could not parse crypto line format for port {current_media_dict['port']}: {line}")
+                        logger.warning(f"SDP Answer: Could not parse crypto line format for port {current_media_dict['port']}: {line}")
+                elif line.startswith("a=crypto:") and current_media_dict["protocol"] == "RTP/AVP":
+                     logger.warning(f"SDP Answer: Ignoring unexpected crypto attribute for non-SAVP stream on port {current_media_dict['port']}: {line}")
 
+
+        # Append the last parsed media description if it exists
         if current_media_dict:
              try:
                  current_media_dict.setdefault("rtpmap", {})
@@ -378,16 +481,19 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
     except Exception as e:
         logger.exception(f"Error parsing SDP answer: {e}")
 
-    valid_media_info: list[SdpMediaInfo] = []
+    # --- Validation of parsed streams ---
+    valid_media_info: List[SdpMediaInfo] = []
     for info in media_info_list:
-        is_savp = info.protocol.endswith("SAVP")
+        is_savp = info.protocol == "RTP/SAVP"
         if info.port == 0:
             logger.warning(f"SDP Answer: Skipping media stream for label '{info.label}' (port is 0).")
         elif not info.connection_ip:
              logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (no connection IP).")
         elif is_savp and not info.crypto_key_material:
-             logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (RTP/SAVP specified but no valid crypto key found/parsed).")
+             # Crypto material is REQUIRED if the negotiated protocol is SAVP
+             logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (RTP/SAVP specified by server but no valid/supported crypto key found/parsed).")
         else:
+             # Stream is valid if: port > 0, has IP, and (protocol is AVP OR (protocol is SAVP AND has crypto))
              valid_media_info.append(info)
 
     if not valid_media_info:
@@ -397,7 +503,6 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
 
 def create_siprec_metadata(config: argparse.Namespace, dest_number: str, dest_host: str) -> str:
     """Creates sample SIPREC metadata XML."""
-    # ... (Metadata creation logic remains the same)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     session_id = generate_call_id()
     conversation_id = "PY_TEST_CONV_" + uuid.uuid4().hex[:8]
@@ -446,13 +551,12 @@ def create_siprec_metadata(config: argparse.Namespace, dest_number: str, dest_ho
     return metadata.replace('\r\n', '\n').replace('\n', CRLF)
 
 
-def parse_sip_response(data: bytes) -> tuple[int | None, dict[str, str | list[str]], bytes]:
+def parse_sip_response(data: bytes) -> tuple[Optional[int], Dict[str, Union[str, List[str]]], bytes]:
     """
     Parses a SIP response buffer into status code, headers, and body.
     """
-    # ... (Response parsing logic remains the same)
-    headers: dict[str, str | list[str]] = {}
-    status_code: int | None = None
+    headers: Dict[str, Union[str, List[str]]] = {}
+    status_code: Optional[int] = None
     body: bytes = b''
 
     try:
@@ -462,7 +566,7 @@ def parse_sip_response(data: bytes) -> tuple[int | None, dict[str, str | list[st
         body = b''
         logger.debug("No body found in response (no CRLFCRLF separator)")
 
-    lines: list[bytes] = header_part.split(CRLF_BYTES)
+    lines: List[bytes] = header_part.split(CRLF_BYTES)
     if not lines:
         logger.error("Received empty or malformed response data.")
         return None, {}, b''
@@ -478,7 +582,7 @@ def parse_sip_response(data: bytes) -> tuple[int | None, dict[str, str | list[st
         logger.error(f"Error parsing status code/reason from status line: {lines[0].decode(errors='ignore')}")
         return None, {}, body
 
-    current_key: str | None = None
+    current_key: Optional[str] = None
     for line_bytes in lines[1:]:
         line_bytes = line_bytes.strip()
         if not line_bytes: continue
@@ -490,9 +594,9 @@ def parse_sip_response(data: bytes) -> tuple[int | None, dict[str, str | list[st
                     current_value = headers[current_key]
                     decoded_append = value_to_append.decode(errors='ignore')
                     if isinstance(current_value, list):
-                        headers[current_key][-1] += decoded_append
+                        headers[current_key][-1] += decoded_append # type: ignore[union-attr]
                     elif isinstance(current_value, str):
-                        headers[current_key] += decoded_append
+                        headers[current_key] = current_value + decoded_append
                 except Exception as e:
                      logger.warning(f"Error appending continuation line to header '{current_key}': {e}")
             else:
@@ -523,7 +627,7 @@ def parse_sip_response(data: bytes) -> tuple[int | None, dict[str, str | list[st
     return status_code, headers, body
 
 
-# --- Main SIP Client Class ---
+# --- Main SIP Client Class (Unchanged init, _create_ssl_context, connect) ---
 class SiprecTester:
     """ Manages the SIPREC test session (TLS connection, SIP messaging, state). """
     def __init__(self, config: argparse.Namespace):
@@ -536,22 +640,21 @@ class SiprecTester:
         self.local_sip_port: int = int(config.local_port) if config.local_port else 0
         self.call_id: str = generate_call_id()
         self.from_tag: str = generate_tag()
-        self.to_tag: str | None = None # Populated after successful INVITE (2xx)
+        self.to_tag: Optional[str] = None # Populated after successful INVITE (2xx)
         self.cseq: int = random.randint(1, 10000) # Start CSeq randomly, increment after non-ACK/BYE req
-        self.sock: socket.socket | None = None
-        self.ssl_sock: ssl.SSLSocket | None = None
+        self.sock: Optional[socket.socket] = None
+        self.ssl_sock: Optional[ssl.SSLSocket] = None
         self._last_branch: str = "" # Stores Via branch of last non-ACK/BYE request (for ACK/BYE Via)
-        self.last_invite_offer_sdp: str | None = None
-        self.last_invite_response_status: int | None = None
-        self.last_invite_response_headers: dict[str, str | list[str]] = {}
+        self.last_invite_offer_sdp: Optional[str] = None
+        self.last_invite_response_status: Optional[int] = None
+        self.last_invite_response_headers: Dict[str, Union[str, List[str]]] = {}
         self.last_invite_response_body: bytes = b''
-        self.last_invite_response_sdp_info: list[SdpMediaInfo] = []
+        self.last_invite_response_sdp_info: List[SdpMediaInfo] = []
         # State tracking for BYE logic
         self.dialog_established: bool = False # Set to True after 2xx for INVITE is processed
 
     def _create_ssl_context(self) -> ssl.SSLContext:
         """Creates an SSL context for TLS with client authentication."""
-        # ... (SSL context creation remains the same)
         context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         if not self.config.cert_file or not self.config.key_file:
@@ -592,7 +695,6 @@ class SiprecTester:
 
     def connect(self) -> None:
         """Establishes the TCP and TLS connection to the SIP server."""
-        # ... (Connect logic remains the same)
         context = self._create_ssl_context()
         bind_addr = ('', self.local_sip_port)
         dest_addr = (self.config.dest_host, self.config.dest_port)
@@ -638,7 +740,7 @@ class SiprecTester:
                  logger.exception(f"Unexpected connection error: {e}")
                  raise ConnectionError(f"Unexpected connection error: {e}") from e
 
-    def _send_request(self, method: str, headers: dict[str, any], body: bytes = b'') -> bool:
+    def _send_request(self, method: str, headers: Dict[str, Any], body: bytes = b'') -> bool:
         """
         Constructs and sends a SIP request over the TLS connection.
         Internal method. Increments CSeq for non-ACK requests.
@@ -704,19 +806,19 @@ class SiprecTester:
         # ACK and BYE *must* have the to_tag.
         if self.to_tag and method != "INVITE":
              # Allow explicit 'To' header override for flexibility (e.g., if passed by caller)
-             if headers.get("To") and ";tag=" in str(headers.get("To")):
+             if headers.get("To") and isinstance(headers.get("To"), str) and ";tag=" in headers.get("To"): # type: ignore[arg-type]
                  logger.debug(f"Using To header provided explicitly for {method}.")
-                 to_header = headers["To"]
+                 to_header = str(headers["To"])
              else:
                  to_header += f";tag={self.to_tag}"
 
         # --- Contact Header (usually only needed in INVITE/OPTIONS/REGISTER) ---
-        contact_header = None
+        contact_header: Optional[str] = None
         if method in ["INVITE", "OPTIONS"]:
             contact_header = f"\"{self.config.src_display_name}\" <sip:{self.config.src_number.split('@')[0]}@{self.local_ip}:{self.local_sip_port};transport=tls>"
 
         # --- Default Headers ---
-        default_hdrs: dict[str, any] = {
+        default_hdrs: Dict[str, Any] = {
             'Via': via_header,
             'From': from_header,
             'To': to_header,
@@ -725,7 +827,8 @@ class SiprecTester:
             'Max-Forwards': str(DEFAULT_MAX_FORWARDS),
             'Contact': contact_header, # Will be None if not INVITE/OPTIONS
             'User-Agent': USER_AGENT,
-            'Content-Length': str(len(body))
+            'Content-Length': str(len(body)),
+            'MIME-Version': '1.0'
         }
 
         # --- Final Headers ---
@@ -737,7 +840,7 @@ class SiprecTester:
         final_hdrs['Content-Length'] = str(len(body))
 
         # --- Construct Message ---
-        message_lines: list[str] = [req_line]
+        message_lines: List[str] = [req_line]
         for key, value in final_hdrs.items():
             # Use canonical capitalization for headers
             canonical_key = '-'.join(word.capitalize() for word in key.split('-'))
@@ -774,11 +877,11 @@ class SiprecTester:
              self.close()
              return False
 
-    def _receive_response(self, timeout: float = 10.0) -> tuple[int | None, dict[str, str | list[str]], bytes, bytes]:
+    def _receive_response(self, timeout: float = 10.0) -> Tuple[Optional[int], Dict[str, Union[str, List[str]]], bytes, bytes]:
         """
         Receives a SIP response using select for timeout. Handles potential read errors.
+        Returns: status_code, headers, body, raw_bytes
         """
-        # ... (Receive logic remains mostly the same, ensures robust timeout/error handling)
         if not self.ssl_sock:
             logger.error("Cannot receive response: Not connected.")
             return None, {}, b'', b''
@@ -786,8 +889,8 @@ class SiprecTester:
         buffer = bytearray()
         raw_buffer_log = bytearray()
         headers_parsed = False
-        content_length: int | None = None
-        expected_total_len: int | None = None
+        content_length: Optional[int] = None
+        expected_total_len: Optional[int] = None
         header_len = 0
         start_time = time.monotonic()
 
@@ -876,6 +979,10 @@ class SiprecTester:
                              logger.warning(f"Read {len(buffer) - expected_total_len} extra bytes past Content-Length. Trimming.")
                              buffer = buffer[:expected_total_len]
                         break
+                elif headers_parsed and content_length is None:
+                    # If headers are parsed but no content-length, assume message ends with header end
+                    logger.debug("Headers parsed, no Content-Length, assuming body-less message complete.")
+                    break
                 elif not headers_parsed and len(buffer) > 16384: # Header limit safeguard
                      logger.warning("Buffer exceeds 16KB without finding header end (CRLFCRLF). Treating as incomplete/malformed.")
                      break
@@ -905,7 +1012,6 @@ class SiprecTester:
 
     def send_options(self) -> bool:
         """Sends a SIP OPTIONS request."""
-        # ... (OPTIONS logic remains the same)
         options_cseq = self.cseq
         logger.info(f"Sending OPTIONS ping (CSeq: {options_cseq})...")
         headers = {
@@ -938,15 +1044,24 @@ class SiprecTester:
         Sends the SIPREC INVITE request. Sets dialog_established on success.
         Returns True if a 2xx final response was received and processed, False otherwise.
         """
-        # ... (INVITE sending logic mostly same, but adds dialog state)
         invite_cseq_num = self.cseq # Capture CSeq number *before* sending
         logger.info(f"Sending SIPREC INVITE (CSeq: {invite_cseq_num})...")
 
-        self.last_invite_offer_sdp = create_sdp_offer(
-            self.local_ip, DEFAULT_SDP_AUDIO_PORT_BASE, self.config.audio_encoding, self.config.packet_time
-        )
+        # Create SDP Offer using the chosen encryption setting from config
+        try:
+            self.last_invite_offer_sdp = create_sdp_offer(
+                self.local_ip,
+                DEFAULT_SDP_AUDIO_PORT_BASE,
+                self.config.audio_encoding,
+                self.config.packet_time,
+                self.config.srtp_encryption # Pass the choice here
+            )
+        except ValueError as sdp_err:
+             logger.error(f"Failed to generate SDP offer: {sdp_err}")
+             return False
+
         if not self.last_invite_offer_sdp:
-             logger.error("Failed to generate SDP offer.")
+             logger.error("Failed to generate SDP offer (unexpected).")
              return False
         sdp_bytes = self.last_invite_offer_sdp.encode('utf-8')
 
@@ -985,8 +1100,8 @@ class SiprecTester:
              self.dialog_established = False # Ensure state is false
              return False
 
-        final_status: int | None = None
-        final_headers: dict[str, str | list[str]] = {}
+        final_status: Optional[int] = None
+        final_headers: Dict[str, Union[str, List[str]]] = {}
         final_body: bytes = b''
         response_count = 0
         max_responses = 10
@@ -1040,15 +1155,19 @@ class SiprecTester:
 
             # Capture To tag (essential for ACK/BYE)
             to_header_val = final_headers.get('to')
-            to_headers_list = to_header_val if isinstance(to_header_val, list) else [to_header_val] if to_header_val else []
+            to_headers_list: List[str] = []
+            if isinstance(to_header_val, list):
+                to_headers_list = [str(h) for h in to_header_val]
+            elif isinstance(to_header_val, str):
+                to_headers_list = [to_header_val]
+
             tag_found = False
             for hdr in to_headers_list:
-                if isinstance(hdr, str):
-                    match = re.search(r'[;,\s]tag=([\w.-]+)', hdr)
-                    if match:
-                        self.to_tag = match.group(1)
-                        tag_found = True
-                        break
+                match = re.search(r'[;,\s]tag=([\w.-]+)', hdr)
+                if match:
+                    self.to_tag = match.group(1)
+                    tag_found = True
+                    break
             if tag_found:
                 logger.info(f"Captured To tag from {final_status} response: {self.to_tag}")
             else:
@@ -1065,8 +1184,8 @@ class SiprecTester:
                      self.dialog_established = False # Cannot proceed with streaming
                      return False
                 for i, info in enumerate(self.last_invite_response_sdp_info):
-                    crypto_ok = info.crypto_suite is not None
-                    logger.info(f"  Parsed Answer Stream {i+1}: Label='{info.label}', Target={info.connection_ip}:{info.port}, Proto={info.protocol}, Crypto={crypto_ok}")
+                    crypto_info = f"Suite={info.crypto_suite}" if info.crypto_suite else "N/A (Plain RTP)"
+                    logger.info(f"  Parsed Answer Stream {i+1}: Label='{info.label}', Target={info.connection_ip}:{info.port}, Proto={info.protocol}, Crypto={crypto_info}")
 
             # If we reached here with a 2xx and got the To tag, the dialog is established
             self.dialog_established = True
@@ -1081,7 +1200,6 @@ class SiprecTester:
 
     def send_ack(self, invite_cseq_num: int) -> bool:
         """Sends an ACK request for a successful INVITE."""
-        # ... (ACK logic remains the same)
         if not self.to_tag:
              logger.error("Cannot send ACK: Missing To tag (must be captured from INVITE 2xx response).")
              return False
@@ -1177,7 +1295,6 @@ class SiprecTester:
 
     def _close_socket(self) -> None:
         """Internal helper to close the plain socket if it exists."""
-        # ... (Close socket logic remains the same)
         if self.sock:
              sock_fd = -1
              try: sock_fd = self.sock.fileno()
@@ -1186,7 +1303,8 @@ class SiprecTester:
              try:
                  try: self.sock.shutdown(socket.SHUT_RDWR)
                  except (socket.error, OSError) as shut_err:
-                      if shut_err.errno not in (socket.errno.ENOTCONN, socket.errno.EBADF, 107): # 107: EPIPE on some systems?
+                      # Common errors to ignore: Not connected, Bad file descriptor
+                      if shut_err.errno not in (socket.errno.ENOTCONN, socket.errno.EBADF, 107, socket.errno.EPIPE):
                            logger.warning(f"Error shutting down plain socket {sock_fd}: {shut_err}")
                  self.sock.close()
                  logger.debug(f"Plain socket (fd={sock_fd}) closed.")
@@ -1255,29 +1373,43 @@ def stream_channel(
     codec_name: str,
     sample_rate: int,
     packet_time_ms: int,
-    srtp_session: pylibsrtp.Session,
+    srtp_session: Optional[pylibsrtp.Session], # MODIFIED: Can be None
     local_rtp_port: int,
     stop_event: threading.Event,
-    max_duration_sec: float | None = None,
+    max_duration_sec: Optional[float] = None,
+    output_filename: Optional[str] = None,
 ):
     """
-    Reads one audio channel, encodes, packetizes, encrypts (SRTP), and sends it.
+    Reads one audio channel, encodes (using soundfile), packetizes, encrypts (SRTP) if
+    srtp_session is provided, sends it, and optionally saves the raw encoded payload
+    to a file. Sends plain RTP if srtp_session is None.
     """
-    # ... (Streaming logic remains the same)
     thread_name = f"Streamer-{channel_index}"
-    logger.info(f"[{thread_name}] Starting: Target={dest_ip}:{dest_port}, Local UDP Port={local_rtp_port}, PT={payload_type}, Codec={codec_name}/{sample_rate}, PTime={packet_time_ms}ms")
+    stream_type = "SRTP" if srtp_session else "RTP" # Determine type for logging
+    logger.info(f"[{thread_name}] Starting {stream_type}: Target={dest_ip}:{dest_port}, Local UDP Port={local_rtp_port}, PT={payload_type}, Codec={codec_name}/{sample_rate}, PTime={packet_time_ms}ms")
 
     samples_per_packet = int(sample_rate * packet_time_ms / 1000)
     packet_interval_sec = packet_time_ms / 1000.0
     timestamp_increment = samples_per_packet
 
-    rtp_socket: socket.socket | None = None
-    audio_file: sf.SoundFile | None = None
+    rtp_socket: Optional[socket.socket] = None
+    audio_file: Optional[sf.SoundFile] = None
+    output_file: Optional[io.BufferedWriter] = None # Added: file handle for output
     stream_start_time = time.monotonic()
     packets_sent = 0
     bytes_sent = 0
+    payload_bytes_saved = 0
 
     try:
+        # --- Open output file if requested ---
+        if output_filename:
+            try:
+                output_file = open(output_filename, 'wb')
+                logger.info(f"[{thread_name}] Will save encoded payload to '{output_filename}'")
+            except IOError as e:
+                logger.error(f"[{thread_name}] Cannot open output file '{output_filename}' for writing: {e}. Stream will continue without saving.")
+                output_file = None # Ensure it's None if open failed
+
         rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rtp_socket.bind(('', local_rtp_port))
         logger.info(f"[{thread_name}] UDP sending socket bound successfully to local port {local_rtp_port}")
@@ -1296,11 +1428,6 @@ def stream_channel(
 
         logger.info(f"[{thread_name}] Audio File Info: Rate={audio_file.samplerate}, Channels={audio_file.channels}, Frames={audio_file.frames or 'Unknown'}")
         logger.info(f"[{thread_name}] RTP Params: SSRC={ssrc:08X}, StartSeq={sequence_number}, StartTS={timestamp}, Samples/Pkt={samples_per_packet}")
-
-        encode_func = None
-        if codec_name == "PCMA": encode_func = linear16_to_alaw
-        elif codec_name == "PCMU": encode_func = linear16_to_ulaw
-        else: raise ValueError(f"Unsupported codec for encoding: {codec_name}")
 
         for block_num, block in enumerate(audio_file.blocks(blocksize=samples_per_packet, dtype='int16', fill_value=0)):
             loop_start_time = time.monotonic()
@@ -1323,7 +1450,29 @@ def stream_channel(
                  padding = np.zeros(padding_needed, dtype=np.int16)
                  channel_data = np.concatenate((channel_data, padding))
 
-            payload = encode_func(channel_data)
+            # --- Use NEW soundfile-based encoding function ---
+            try:
+                payload = encode_audio_segment(channel_data, codec_name, sample_rate)
+            except (ValueError, sf.SoundFileError, TypeError) as enc_err:
+                 logger.error(f"[{thread_name}] Failed to encode audio block {block_num}: {enc_err}. Stopping stream.")
+                 stop_event.set()
+                 break
+            except Exception as enc_exc:
+                logger.exception(f"[{thread_name}] Unexpected error encoding audio block {block_num}: {enc_exc}. Stopping stream.")
+                stop_event.set()
+                break
+
+            # --- Save encoded payload to file if requested ---
+            if output_file:
+                try:
+                    output_file.write(payload)
+                    payload_bytes_saved += len(payload)
+                except IOError as e:
+                    logger.warning(f"[{thread_name}] Error writing encoded payload to file '{output_filename}': {e}. Disabling saving for this stream.")
+                    try:
+                         output_file.close() # Close it if writing fails
+                    except Exception: pass
+                    output_file = None # Stop further attempts
 
             version = 2; padding_flag = 0; extension_flag = 0; csrc_count = 0; marker_bit = 0
             header_byte1 = (version << 6) | (padding_flag << 5) | (extension_flag << 4) | csrc_count
@@ -1335,29 +1484,38 @@ def stream_channel(
                                       ssrc)
             rtp_packet = rtp_header + payload
 
-            try:
-                srtp_packet = srtp_session.protect(rtp_packet)
-            except pylibsrtp.Error as srtp_err:
-                logger.error(f"[{thread_name}] SRTP protection failed (Seq={sequence_number}): {srtp_err}")
-                stop_event.set()
-                break
-            except Exception as protect_err:
-                logger.exception(f"[{thread_name}] Unexpected error during SRTP protect (Seq={sequence_number}): {protect_err}")
-                stop_event.set()
-                break
+            packet_to_send: bytes
+
+            # --- Encrypt if SRTP session exists ---
+            if srtp_session:
+                try:
+                    packet_to_send = srtp_session.protect(rtp_packet)
+                    log_pkt_type = "SRTP"
+                except pylibsrtp.Error as srtp_err:
+                    logger.error(f"[{thread_name}] SRTP protection failed (Seq={sequence_number}): {srtp_err}")
+                    stop_event.set()
+                    break
+                except Exception as protect_err:
+                    logger.exception(f"[{thread_name}] Unexpected error during SRTP protect (Seq={sequence_number}): {protect_err}")
+                    stop_event.set()
+                    break
+            else:
+                # --- Send plain RTP ---
+                packet_to_send = rtp_packet
+                log_pkt_type = "RTP"
 
             try:
-                bytes_sent_this_packet = rtp_socket.sendto(srtp_packet, (dest_ip, dest_port))
+                bytes_sent_this_packet = rtp_socket.sendto(packet_to_send, (dest_ip, dest_port))
                 bytes_sent += bytes_sent_this_packet
                 packets_sent += 1
                 if packets_sent % 100 == 1:
-                    logger.debug(f"[{thread_name}] Sent SRTP packet: Seq={sequence_number}, TS={timestamp}, Size={bytes_sent_this_packet}")
+                    logger.debug(f"[{thread_name}] Sent {log_pkt_type} packet: Seq={sequence_number}, TS={timestamp}, Size={bytes_sent_this_packet}")
             except socket.error as send_err:
-                logger.error(f"[{thread_name}] Socket error sending SRTP (Seq={sequence_number}): {send_err}")
+                logger.error(f"[{thread_name}] Socket error sending {log_pkt_type} (Seq={sequence_number}): {send_err}")
                 stop_event.set()
                 break
             except Exception as send_exc:
-                logger.exception(f"[{thread_name}] Unexpected error sending SRTP (Seq={sequence_number}): {send_exc}")
+                logger.exception(f"[{thread_name}] Unexpected error sending {log_pkt_type} (Seq={sequence_number}): {send_exc}")
                 stop_event.set()
                 break
 
@@ -1371,13 +1529,16 @@ def stream_channel(
             elif packets_sent > 10:
                  logger.warning(f"[{thread_name}] Loop processing time ({elapsed_time:.4f}s) exceeded packet interval ({packet_interval_sec:.4f}s). Stream may be falling behind.")
 
-        logger.info(f"[{thread_name}] Streaming loop finished. Packets sent: {packets_sent}, Bytes sent: {bytes_sent}")
+        logger.info(f"[{thread_name}] Streaming loop finished. Packets sent: {packets_sent}, Bytes sent: {bytes_sent} ({stream_type})")
+        if output_filename:
+             logger.info(f"[{thread_name}] Saved {payload_bytes_saved} bytes of encoded payload to '{output_filename}'")
 
     except sf.SoundFileError as e:
         logger.error(f"[{thread_name}] Error accessing audio file '{audio_file_path}': {e}")
         stop_event.set()
     except pylibsrtp.Error as e:
-         logger.error(f"[{thread_name}] SRTP context configuration error: {e}")
+         # This might happen if passed a session object created with bad keys/policy earlier
+         logger.error(f"[{thread_name}] SRTP session error (likely during setup): {e}")
          stop_event.set()
     except ValueError as e:
          logger.error(f"[{thread_name}] Configuration or file processing error: {e}")
@@ -1395,6 +1556,13 @@ def stream_channel(
         if rtp_socket:
             try: rtp_socket.close()
             except Exception as close_err: logger.warning(f"[{thread_name}] Error closing RTP socket: {close_err}")
+        # --- Close output file ---
+        if output_file:
+            try:
+                output_file.close()
+                logger.info(f"[{thread_name}] Closed encoded output file '{output_filename}'.")
+            except Exception as close_err:
+                logger.warning(f"[{thread_name}] Error closing encoded output file '{output_filename}': {close_err}")
         logger.info(f"[{thread_name}] Streaming thread terminated.")
 
 
@@ -1403,13 +1571,12 @@ def stream_channel(
 def main() -> None:
     """ Main function: Parse args, run SIP client, optionally stream, send BYE, clean up. """
 
-    # ... (Argument parsing remains the same)
     ssl_key_log_file_path = os.environ.get('SSLKEYLOGFILE')
     if ssl_key_log_file_path: print(f"INFO: SSLKEYLOGFILE environment variable detected: {ssl_key_log_file_path}", file=sys.stderr)
     else: print("INFO: SSLKEYLOGFILE environment variable not set. Set it to log TLS keys for potential decryption (e.g., in Wireshark).", file=sys.stderr)
 
     parser = argparse.ArgumentParser(
-        description=f"Python SIPREC Test Client with SRTP Streaming using pylibsrtp (v{USER_AGENT.split('/')[1]})",
+        description=f"Python SIPREC Test Client with SRTP/RTP Streaming using pylibsrtp (v{USER_AGENT.split('/')[1]})",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="Requires pylibsrtp, soundfile, numpy. Sends BYE on exit if INVITE succeeded.\n"
                f"Default packet capture filters match Google Telephony ranges:\n"
@@ -1439,9 +1606,14 @@ def main() -> None:
     parser.add_argument("--options-target-uri", help="Optional Request-URI for OPTIONS.")
     parser.add_argument("--call-info-url", help="URL for Call-Info header (e.g., CCAI conversation URL)")
     # Media Streaming Configuration
-    parser.add_argument("--audio-file", help="Path to 2-channel audio file (e.g., WAV) for SRTP streaming.")
+    parser.add_argument("--srtp-encryption", default=DEFAULT_SRTP_ENCRYPTION, choices=SRTP_ENCRYPTION_CHOICES,
+                        help="SRTP encryption profile to offer, or 'NONE' for plain RTP.") # MODIFIED: Added argument
+    parser.add_argument("--audio-file", help="Path to 2-channel audio file (e.g., WAV) for RTP/SRTP streaming.")
     parser.add_argument("--packet-time", type=int, default=DEFAULT_PACKET_TIME_MS, help="RTP packet duration (ms)")
     parser.add_argument("--stream-duration", type=float, default=0, help="Max stream duration (sec, 0=until file end/Ctrl+C)")
+    # Added: Arguments for saving encoded streams
+    parser.add_argument("--save-stream1-file", help="Save encoded payload for stream 1 (label 1) to this file (e.g., stream1.pcma).")
+    parser.add_argument("--save-stream2-file", help="Save encoded payload for stream 2 (label 2) to this file (e.g., stream2.pcma).")
     # Tooling and Debugging
     parser.add_argument("-d", "--debug", action="store_true", help="Enable DEBUG level logging.")
     # Packet Capture Configuration
@@ -1460,10 +1632,11 @@ def main() -> None:
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.getLogger().setLevel(log_level)
     logger.setLevel(log_level)
+    encoder_logger.setLevel(log_level) # Set encoder logger level too
     if log_level == logging.DEBUG: logger.debug("Debug logging enabled.")
+    logger.info(f"Selected SRTP encryption offer: {args.srtp_encryption}") # Log selected encryption
 
     # --- Argument Validation ---
-    # ... (Validation logic remains the same)
     if '@' not in args.src_number:
         logger.warning(f"Source number '{args.src_number}' doesn't contain '@'. Appending '@{args.src_host}'.")
         args.src_number = f"{args.src_number}@{args.src_host}"
@@ -1472,31 +1645,58 @@ def main() -> None:
          if args.ca_file: required_files['ca-file'] = args.ca_file
          if args.audio_file: required_files['audio-file'] = args.audio_file
          for name, path in required_files.items():
+              if not path: # Handle cases where optional files are None/empty
+                   continue
               if not os.path.isfile(path):
                    raise FileNotFoundError(f"Required file --{name} not found or is not a file: {path}")
     except FileNotFoundError as fnf_error:
          print(f"Error: {fnf_error}", file=sys.stderr)
          sys.exit(1)
 
+    # Added: Validation for saving streams
+    if (args.save_stream1_file or args.save_stream2_file) and not args.audio_file:
+         logger.warning("Saving encoded streams (--save-stream*-file) requested, but no --audio-file provided. Saving will be skipped.")
+
     parsed_encoding = False
     try:
         parts = args.audio_encoding.split('/')
         if len(parts) == 2 and parts[1].isdigit():
             enc_name = parts[0].strip().upper()
+            # Validate against the payload type map which includes G711A/U aliases
             if enc_name in AUDIO_ENCODING_TO_PAYLOAD_TYPE:
-                parsed_encoding = True
+                 # Also check if soundfile supports the specific subtype needed
+                 subtype = None
+                 if enc_name == "PCMA" or enc_name == "G711A": subtype = "ALAW"
+                 elif enc_name == "PCMU" or enc_name == "G711U": subtype = "ULAW"
+                 if subtype and sf.check_format("RAW", subtype):
+                    parsed_encoding = True
+                 else:
+                    logger.warning(f"Audio encoding '{enc_name}' recognized but soundfile may not support RAW/{subtype}. Check libsndfile installation.")
+                    # Allow proceeding, but it might fail in stream_channel
+                    parsed_encoding = True
             else: logger.warning(f"Audio encoding name '{enc_name}' not explicitly mapped. Ensure server supports it.")
-        if not parsed_encoding: raise ValueError("Invalid format")
+        if not parsed_encoding: raise ValueError("Invalid format or unsupported by soundfile")
     except ValueError:
-        logger.warning(f"Provided --audio-encoding '{args.audio_encoding}' is invalid. Using default '{DEFAULT_AUDIO_ENCODING}'.")
+        logger.warning(f"Provided --audio-encoding '{args.audio_encoding}' is invalid or unsupported by soundfile. Using default '{DEFAULT_AUDIO_ENCODING}'.")
         args.audio_encoding = DEFAULT_AUDIO_ENCODING
 
+    # Validate SRTP choice (already done by argparse choices, but double check)
+    if args.srtp_encryption.upper() != "NONE" and args.srtp_encryption not in SUPPORTED_SRTP_CIPHERS_SDES:
+         print(f"Error: Invalid --srtp-encryption choice '{args.srtp_encryption}'. Must be one of {SRTP_ENCRYPTION_CHOICES}", file=sys.stderr)
+         sys.exit(1)
+
+    # --- Add a mapping from SDP suite names to pylibsrtp constants ---
+    SDP_SUITE_TO_PYLIBSRTP_PROFILE = {
+        "AES_CM_128_HMAC_SHA1_80": pylibsrtp.Policy.SRTP_PROFILE_AES128_CM_SHA1_80,
+        "AES_CM_128_HMAC_SHA1_32": pylibsrtp.Policy.SRTP_PROFILE_AES128_CM_SHA1_32,
+        # Add other mappings here if needed in the future
+    }
+
     # --- Packet Capture Setup ---
-    # ... (Packet capture setup logic remains the same)
-    tshark_process: subprocess.Popen | None = None
+    tshark_process: Optional[subprocess.Popen] = None
     tshark_failed_to_start: bool = False
     pcap_base_file = args.pcap_file
-    pcap_decrypted_file: str | None = None
+    pcap_decrypted_file: Optional[str] = None
 
     if args.pcap_file:
         tshark_path = shutil.which("tshark")
@@ -1515,42 +1715,62 @@ def main() -> None:
                  bpf_filter = f"{sip_condition} or {media_condition}"
                  logger.info(f"Using tshark BPF filter: {bpf_filter}")
 
-                 if ssl_key_log_file_path and os.path.exists(ssl_key_log_file_path):
+                 # Decryption only possible if keys are logged
+                 will_attempt_decryption = ( ssl_key_log_file_path and
+                                             os.path.exists(ssl_key_log_file_path))
+
+                 if will_attempt_decryption:
                      base, ext = os.path.splitext(pcap_base_file)
                      pcap_decrypted_file = f"{base}-decrypted{ext or '.pcapng'}"
-                     logger.info(f"SSLKEYLOGFILE is set. Will attempt key injection into '{pcap_decrypted_file}' using editcap after capture.")
+                     logger.info(f"SSLKEYLOGFILE is set and SRTP offered. Will attempt key injection into '{pcap_decrypted_file}' using editcap after capture.")
                  elif ssl_key_log_file_path:
-                      logger.warning(f"SSLKEYLOGFILE is set ('{ssl_key_log_file_path}') but file not found. Pcap won't be automatically decrypted.")
-                 else:
-                     logger.warning("SSLKEYLOGFILE is not set. Captured pcap file will not be automatically decrypted.")
+                      if args.srtp_encryption.upper() == "NONE":
+                           logger.info("SSLKEYLOGFILE is set, but plain RTP offered. Pcap decryption is not applicable.")
+                      elif not os.path.exists(ssl_key_log_file_path):
+                          logger.warning(f"SSLKEYLOGFILE is set ('{ssl_key_log_file_path}') but file not found. Pcap won't be automatically decrypted.")
+                 else: # SSLKEYLOGFILE not set
+                     if args.srtp_encryption.upper() != "NONE":
+                         logger.warning("SSLKEYLOGFILE is not set, but SRTP offered. Captured pcap file will not be automatically decrypted.")
+                     else:
+                          logger.info("SSLKEYLOGFILE not set and plain RTP offered. No decryption needed.")
+
 
                  tshark_cmd = [tshark_path, "-i", args.capture_interface, "-f", bpf_filter, "-w", pcap_base_file]
                  logger.info(f"Starting packet capture command: {' '.join(tshark_cmd)}")
                  if args.capture_interface == 'any': logger.info("Interface 'any' may require root/admin privileges.")
 
+                 # Redirect stderr to PIPE to capture potential errors
                  tshark_process = subprocess.Popen(
-                     tshark_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+                     tshark_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace'
                  )
-                 time.sleep(TSHARK_STARTUP_WAIT_SEC)
-                 if tshark_process.poll() is not None:
-                     stderr_output = tshark_process.stderr.read() if tshark_process.stderr else ""
+                 time.sleep(TSHARK_STARTUP_WAIT_SEC) # Give tshark time to start and potentially fail
+                 if tshark_process.poll() is not None: # Check if process exited
+                     stderr_output = ""
+                     try:
+                         # Read stderr non-blockingly
+                          stderr_output = tshark_process.stderr.read() if tshark_process.stderr else ""
+                     except Exception as read_err:
+                         logger.warning(f"Error reading tshark stderr: {read_err}")
+
                      logger.error(f"tshark process terminated unexpectedly shortly after start (exit code: {tshark_process.returncode}).")
                      logger.error(f"Check permissions, interface name ('{args.capture_interface}'), filter syntax ('{bpf_filter}'), or tshark installation.")
                      if stderr_output: logger.error(f"tshark stderr: {stderr_output.strip()}")
-                     tshark_process = None
+                     tshark_process = None # Clear the process variable
                      tshark_failed_to_start = True
                  else:
                      logger.info("tshark process appears to have started successfully.")
 
             except Exception as e:
                  logger.error(f"Failed to start tshark process: {e}. Capture disabled.", exc_info=args.debug)
-                 if tshark_process and tshark_process.poll() is None: tshark_process.kill()
+                 if tshark_process and tshark_process.poll() is None:
+                      try: tshark_process.kill()
+                      except Exception: pass # Ignore errors killing already dead process
                  tshark_process = None
                  tshark_failed_to_start = True
 
     # --- Main Client Logic ---
-    client: SiprecTester | None = None
-    stream_threads: list[threading.Thread] = []
+    client: Optional[SiprecTester] = None
+    stream_threads: List[threading.Thread] = []
     stop_stream_event = threading.Event()
     exit_code = 0
 
@@ -1564,7 +1784,6 @@ def main() -> None:
 
         # --- OPTIONS Pings ---
         if args.options_ping_count > 0:
-            # ... (OPTIONS ping logic remains the same)
             logger.info(f"Starting OPTIONS ping sequence: {args.options_ping_count} pings requested.")
             ping_success = True
             for i in range(args.options_ping_count):
@@ -1606,64 +1825,114 @@ def main() -> None:
 
             # --- Attempt Media Streaming ---
             if args.audio_file:
-                # ... (Streaming setup and execution logic remains the same)
-                logger.info(f"Audio file specified ({args.audio_file}). Preparing SRTP media streaming...")
+                logger.info(f"Audio file specified ({args.audio_file}). Preparing RTP/SRTP media streaming...")
                 sdp_answer_info = client.last_invite_response_sdp_info
 
                 if len(sdp_answer_info) < 2:
                     logger.error(f"Expected at least 2 valid media streams in SDP answer, found {len(sdp_answer_info)}. Cannot stream.")
                     exit_code = 1
                 else:
+                    srtp_session_1: Optional[pylibsrtp.Session] = None
+                    srtp_session_2: Optional[pylibsrtp.Session] = None
                     try:
                         valid_audio_streams = [info for info in sdp_answer_info if info.media_type == 'audio']
                         if len(valid_audio_streams) < 2:
                              raise ValueError(f"Found only {len(valid_audio_streams)} usable audio streams in SDP answer.")
 
+                        # Attempt to find streams explicitly labeled '1' and '2'
                         stream_info_1 = next((info for info in valid_audio_streams if info.label == '1'), None)
                         stream_info_2 = next((info for info in valid_audio_streams if info.label == '2'), None)
-                        if stream_info_1 is None: stream_info_1 = valid_audio_streams[0]
+
+                        # Fallback: if labels missing or different, use first two valid audio streams
+                        if stream_info_1 is None:
+                            logger.warning("SDP Answer missing label '1', using first valid audio stream.")
+                            stream_info_1 = valid_audio_streams[0]
                         if stream_info_2 is None:
+                            logger.warning("SDP Answer missing label '2', using second valid audio stream (if distinct).")
                             potential_s2 = valid_audio_streams[1] if len(valid_audio_streams)>1 else None
-                            stream_info_2 = potential_s2 if potential_s2 is not stream_info_1 else None
-                        if stream_info_1 is None or stream_info_2 is None or stream_info_1 is stream_info_2:
+                            # Ensure we didn't pick the same stream twice if only one label was missing
+                            if potential_s2 is not stream_info_1:
+                                stream_info_2 = potential_s2
+                            else:
+                                logger.error("Could not find a second distinct audio stream.")
+                                stream_info_2 = None # Ensure it's None if fallback fails
+
+                        if stream_info_1 is None or stream_info_2 is None:
+                            logger.error(f"Could not determine two distinct audio streams from SDP answer. Found: {[f'L:{i.label} P:{i.port} Proto:{i.protocol}' for i in valid_audio_streams]}")
                             raise ValueError("Could not determine two distinct audio streams from SDP answer.")
 
-                        logger.info(f"Stream 1 mapped to SDP Answer: Port={stream_info_1.port}, Label='{stream_info_1.label}', Target={stream_info_1.connection_ip}")
-                        logger.info(f"Stream 2 mapped to SDP Answer: Port={stream_info_2.port}, Label='{stream_info_2.label}', Target={stream_info_2.connection_ip}")
+                        logger.info(f"Stream 1 mapped to SDP Answer: Port={stream_info_1.port}, Label='{stream_info_1.label}', Target={stream_info_1.connection_ip}, Protocol={stream_info_1.protocol}")
+                        logger.info(f"Stream 2 mapped to SDP Answer: Port={stream_info_2.port}, Label='{stream_info_2.label}', Target={stream_info_2.connection_ip}, Protocol={stream_info_2.protocol}")
 
-                        if not all([stream_info_1.connection_ip, stream_info_1.port > 0, stream_info_1.crypto_key_material, stream_info_1.crypto_suite,
-                                    stream_info_2.connection_ip, stream_info_2.port > 0, stream_info_2.crypto_key_material, stream_info_2.crypto_suite]):
-                             raise ValueError("Missing required IP, Port, or Crypto Key information in parsed SDP answer streams.")
+                        # Validate essential fields (IP/Port) before proceeding
+                        if not all([stream_info_1.connection_ip, stream_info_1.port > 0,
+                                    stream_info_2.connection_ip, stream_info_2.port > 0]):
+                             raise ValueError("Missing required IP or Port information in parsed SDP answer streams.")
 
+                        # --- Initialize SRTP session 1 (with explicit profile) ---
+                        if stream_info_1.protocol == "RTP/SAVP":
+                            if stream_info_1.crypto_key_material and stream_info_1.crypto_suite:
+                                profile = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(stream_info_1.crypto_suite)
+                                if profile is None:
+                                    raise ValueError(f"Stream 1 negotiated unsupported SRTP suite: {stream_info_1.crypto_suite}")
+
+                                policy1 = pylibsrtp.Policy(
+                                    key=stream_info_1.crypto_key_material,
+                                    ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND,
+                                    srtp_profile=profile # Explicitly set the profile
+                                )
+                                srtp_session_1 = pylibsrtp.Session(policy=policy1)
+                                logger.info(f"Using SRTP for Stream 1 (Target {stream_info_1.connection_ip}:{stream_info_1.port}, Suite: {stream_info_1.crypto_suite}, Profile: {profile})")
+                            else:
+                                raise ValueError(f"Stream 1 negotiated SAVP but missing crypto details in SDP answer.")
+                        else: # RTP/AVP
+                            logger.info(f"Using plain RTP for Stream 1 (Target {stream_info_1.connection_ip}:{stream_info_1.port})")
+
+                        # --- Initialize SRTP session 2 (with explicit profile) ---
+                        if stream_info_2.protocol == "RTP/SAVP":
+                            if stream_info_2.crypto_key_material and stream_info_2.crypto_suite:
+                                profile = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(stream_info_2.crypto_suite)
+                                if profile is None:
+                                    raise ValueError(f"Stream 2 negotiated unsupported SRTP suite: {stream_info_2.crypto_suite}")
+
+                                policy2 = pylibsrtp.Policy(
+                                    key=stream_info_2.crypto_key_material,
+                                    ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND,
+                                    srtp_profile=profile # Explicitly set the profile
+                                )
+                                srtp_session_2 = pylibsrtp.Session(policy=policy2)
+                                logger.info(f"Using SRTP for Stream 2 (Target {stream_info_2.connection_ip}:{stream_info_2.port}, Suite: {stream_info_2.crypto_suite}, Profile: {profile})")
+                            else:
+                                raise ValueError(f"Stream 2 negotiated SAVP but missing crypto details in SDP answer.")
+                        else: # RTP/AVP
+                             logger.info(f"Using plain RTP for Stream 2 (Target {stream_info_2.connection_ip}:{stream_info_2.port})")
+
+
+                        # Common stream parameters
                         parts = args.audio_encoding.split('/')
                         codec_name = parts[0].strip().upper()
                         sample_rate = int(parts[1].strip())
                         payload_type = AUDIO_ENCODING_TO_PAYLOAD_TYPE.get(codec_name)
                         if payload_type is None: raise ValueError(f"Internal error: Codec PT lookup failed for {codec_name}")
 
-                        policy1 = pylibsrtp.Policy(key=stream_info_1.crypto_key_material, ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND)
-                        srtp_session1 = pylibsrtp.Session(policy=policy1)
-                        logger.info(f"Created SRTP context 1 for target {stream_info_1.connection_ip}:{stream_info_1.port} (Suite: {stream_info_1.crypto_suite})")
-
-                        policy2 = pylibsrtp.Policy(key=stream_info_2.crypto_key_material, ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND)
-                        srtp_session2 = pylibsrtp.Session(policy=policy2)
-                        logger.info(f"Created SRTP context 2 for target {stream_info_2.connection_ip}:{stream_info_2.port} (Suite: {stream_info_2.crypto_suite})")
-
                         local_rtp_port1 = DEFAULT_SDP_AUDIO_PORT_BASE
                         local_rtp_port2 = DEFAULT_SDP_AUDIO_PORT_BASE + 2
 
+                        # Pass the potentially None srtp_session objects
                         thread1 = threading.Thread(
                             target=stream_channel,
                             args=(0, args.audio_file, stream_info_1.connection_ip, stream_info_1.port,
                                   payload_type, codec_name, sample_rate, args.packet_time,
-                                  srtp_session1, local_rtp_port1, stop_stream_event, args.stream_duration),
+                                  srtp_session_1, local_rtp_port1, stop_stream_event, args.stream_duration,
+                                  args.save_stream1_file),
                             daemon=True, name="Streamer-0"
                         )
                         thread2 = threading.Thread(
                             target=stream_channel,
                             args=(1, args.audio_file, stream_info_2.connection_ip, stream_info_2.port,
                                   payload_type, codec_name, sample_rate, args.packet_time,
-                                  srtp_session2, local_rtp_port2, stop_stream_event, args.stream_duration),
+                                  srtp_session_2, local_rtp_port2, stop_stream_event, args.stream_duration,
+                                  args.save_stream2_file),
                             daemon=True, name="Streamer-1"
                         )
                         stream_threads.extend([thread1, thread2])
@@ -1679,7 +1948,8 @@ def main() -> None:
                                   logger.warning("Stop event detected during wait loop, likely due to thread error.")
                                   exit_code = 1
                                   break
-                             if args.stream_duration > 0 and (time.monotonic() - start_wait > args.stream_duration + 2.0):
+                             # Check duration only if positive value provided
+                             if args.stream_duration and args.stream_duration > 0 and (time.monotonic() - start_wait > args.stream_duration + 2.0): # Add grace period
                                   logger.info(f"Maximum stream duration ({args.stream_duration}s) elapsed. Signaling threads to stop.")
                                   stop_stream_event.set()
                                   break
@@ -1696,8 +1966,12 @@ def main() -> None:
 
             else: # No audio file specified, but INVITE was successful
                 logger.info("No audio file specified (--audio-file), skipping media streaming.")
-                logger.info("Holding connection open for 2 seconds before sending BYE...")
-                time.sleep(2)
+                if args.save_stream1_file or args.save_stream2_file:
+                     logger.info("Skipping saving of encoded streams as no audio file was provided.")
+                # Decide if we wait or just send BYE immediately
+                wait_time = 2
+                logger.info(f"Holding connection open for {wait_time} seconds before sending BYE...")
+                time.sleep(wait_time)
 
         # Handle INVITE failure cases (non-2xx final response or critical error during processing)
         else:
@@ -1743,14 +2017,14 @@ def main() -> None:
         if client and client.dialog_established:
             logger.info("Attempting to send BYE before closing connection...")
             try:
-                # send_bye() will log its own success/failure
+                # send_bye() will log its own success/failure and set dialog_established=False
                 client.send_bye()
             except Exception as bye_err:
                  # Catch unexpected errors during the BYE attempt itself
                  logger.error(f"Unexpected error occurred during send_bye(): {bye_err}", exc_info=args.debug)
             # Proceed to close connection regardless of BYE success
         elif client:
-             logger.debug("Skipping BYE attempt (dialog was not established).")
+             logger.debug("Skipping BYE attempt (dialog was not established or already terminated).")
 
         # Close SIP connection
         if client:
@@ -1759,7 +2033,6 @@ def main() -> None:
 
         # Stop packet capture (tshark process)
         if tshark_process and tshark_process.poll() is None:
-            # ... (tshark stopping logic remains the same)
             logger.info(f"Stopping tshark process (PID: {tshark_process.pid})...")
             try:
                 tshark_process.terminate()
@@ -1773,33 +2046,37 @@ def main() -> None:
                     except subprocess.TimeoutExpired: logger.error("tshark process did not respond to KILL signal.")
                 logger.debug("Waiting briefly for capture file to finalize...")
                 time.sleep(1.0)
-                logger.info(f"Packet capture stopped. Raw output should be in '{pcap_base_file}'")
+                if os.path.exists(pcap_base_file):
+                     logger.info(f"Packet capture stopped. Raw output should be in '{pcap_base_file}'")
+                else:
+                    logger.warning(f"Packet capture stopped, but raw output file '{pcap_base_file}' was not found.")
+
             except Exception as e:
                 logger.error(f"Error stopping tshark process: {e}")
-        elif tshark_process:
+        elif tshark_process: # Process exists but poll() returned non-None (already terminated)
             logger.warning(f"tshark process (PID: {tshark_process.pid}) was found already terminated before cleanup (exit code: {tshark_process.returncode}). Capture might be incomplete.")
-        elif args.pcap_file and not tshark_failed_to_start:
+        elif args.pcap_file and not tshark_failed_to_start: # Pcap requested, tshark didn't fail start, but no process obj
              logger.warning("Capture file was requested, tshark didn't fail start, but process object is missing at cleanup.")
 
 
         # --- Attempt to inject keys using editcap ---
-        if args.pcap_file and not tshark_failed_to_start and pcap_decrypted_file:
-             # ... (editcap logic remains the same)
+        # Only attempt if: pcap file requested, tshark started ok, decryption file path generated, raw pcap exists, keys file exists
+        if (args.pcap_file and not tshark_failed_to_start and pcap_decrypted_file and
+            ssl_key_log_file_path and os.path.exists(ssl_key_log_file_path)):
+
             logger.info(f"Attempting to inject TLS keys into pcap file using editcap...")
             editcap_path = shutil.which("editcap")
             if not editcap_path:
                 logger.error("'editcap' executable not found in system PATH. Cannot inject keys.")
             elif not os.path.exists(pcap_base_file):
                  logger.error(f"Cannot inject keys: Raw pcap file '{pcap_base_file}' not found or not created.")
-            elif not ssl_key_log_file_path or not os.path.exists(ssl_key_log_file_path):
-                 logger.error(f"Cannot inject keys: SSLKEYLOGFILE '{ssl_key_log_file_path}' not found.")
             elif os.path.getsize(pcap_base_file) == 0:
                  logger.warning(f"Raw pcap file '{pcap_base_file}' is empty. Skipping key injection.")
             else:
                  cmd = [editcap_path, "--inject-secrets", f"tls,{ssl_key_log_file_path}", pcap_base_file, pcap_decrypted_file]
                  logger.debug(f"Running command: {' '.join(cmd)}")
                  try:
-                     result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+                     result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
                      logger.info(f"Successfully injected keys into '{pcap_decrypted_file}'")
                      if result.stdout: logger.debug(f"editcap stdout:\n{result.stdout.strip()}")
                      if result.stderr: logger.debug(f"editcap stderr:\n{result.stderr.strip()}")
@@ -1814,8 +2091,14 @@ def main() -> None:
                      logger.error(f"editcap command timed out after 30 seconds.")
                  except Exception as e:
                      logger.error(f"An unexpected error occurred while running editcap: {e}", exc_info=args.debug)
-        elif args.pcap_file and ssl_key_log_file_path and not pcap_decrypted_file:
-             logger.warning("Capture ran and SSLKEYLOGFILE was set, but conditions for key injection not fully met. Skipping.")
+        elif args.pcap_file and args.srtp_encryption != "NONE" and ssl_key_log_file_path:
+             # Log why decryption wasn't attempted if conditions weren't fully met
+             if tshark_failed_to_start: logger.info("Skipping key injection because tshark failed to start.")
+             elif not pcap_decrypted_file: logger.info("Skipping key injection (internal state error, decrypted file path not set).")
+             elif not os.path.exists(ssl_key_log_file_path): logger.info(f"Skipping key injection because key log file not found: {ssl_key_log_file_path}")
+             # Raw pcap existence check happens just before running editcap
+        elif args.pcap_file and args.srtp_encryption == "NONE":
+             logger.info("Plain RTP was used, no TLS key injection needed for media.")
         elif args.pcap_file and not ssl_key_log_file_path:
              logger.info("SSLKEYLOGFILE not set, skipping key injection step.")
 
@@ -1826,6 +2109,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     if sys.version_info < (3, 8):
-         print("Error: This script requires Python 3.8 or later for some features.", file=sys.stderr)
+         print("Error: This script requires Python 3.8 or later.", file=sys.stderr)
          sys.exit(1)
     main()
