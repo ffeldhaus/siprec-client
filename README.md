@@ -1,266 +1,210 @@
-# Python SIPREC TLS Test Client
+# Python SIPREC TLS Test Client with SRTP/RTP Streaming
 
 ## Description
 
-This command-line tool is a basic Python client designed for testing SIPREC (Session Recording Protocol, RFC 7865) Session Recording Servers (SRS) that require TLS connections with mutual authentication (client certificate validation).
+This command-line tool is a Python client designed for testing SIPREC (Session Recording Protocol, RFC 7865) Session Recording Servers (SRS). It focuses on establishing secure TLS connections with mutual authentication and streaming audio from a file using SRTP (Secure Real-time Transport Protocol) or plain RTP.
 
-It establishes a secure TLS connection, optionally performs OPTIONS pings, sends a SIP INVITE request containing SDP (Session Description Protocol) and SIPREC metadata, handles the server's response, sends the required ACK, and then closes the connection. The SIP INVITE body uses a manually constructed `multipart/mixed` format.
+It establishes a TLS connection, optionally performs OPTIONS pings, sends a SIP INVITE with SDP (offering SRTP/RTP) and SIPREC metadata, handles the server's response (parsing SDP answer for media details like destination IP/port and SRTP keys), sends ACK, streams audio from a file in separate threads (one per channel, based on SDP labels), optionally saves the raw encoded streams to WAV files, sends BYE upon completion or interrupt, and closes the connection.
 
-A key feature is its optional integration with `tshark` (from the Wireshark suite) to directly capture the network traffic during the test session to a PCAPNG file. If the `SSLKEYLOGFILE` environment variable is set correctly *before* running the script, it will subsequently attempt to use `editcap` (also from Wireshark) to inject the captured TLS session keys into a second, decrypted PCAPNG file, allowing easy analysis in Wireshark.
+**IMPORTANT WARNING:** Based on current testing, using SRTP (`--srtp-encryption AES_CM_128_HMAC_SHA1_80` or similar) is **known not to work reliably with Google Cloud SIP SBCs**. The negotiation may appear successful, but media does not flow correctly. Using plain **RTP** (`--srtp-encryption NONE`) is the recommended and functional approach when targeting Google Cloud SIP SBCs.
+
+It uses `pylibsrtp` for SRTP handling and `soundfile`+`numpy` for reliable G.711 audio encoding.
+
+The client optionally integrates with `tshark` and `editcap` (from Wireshark) to capture network traffic and inject TLS keys for easier debugging in Wireshark, provided the `SSLKEYLOGFILE` environment variable is set.
 
 ## Features
 
-*   Connects to SIPREC SRS using **TLS v1.2+**.
-*   Supports **client certificate authentication**.
-*   Sends configurable number of **OPTIONS** requests (pings) before INVITE.
-*   Sends SIP **INVITE** requests compliant with SIPREC requirements (`Require: siprec`).
-*   Constructs `multipart/mixed` body **manually** containing:
-    *   `application/sdp` part
-    *   `application/rs-metadata+xml` part (SIPREC metadata)
-*   Configurable **audio codec** for SDP (e.g., PCMA/8000, PCMU/8000).
+*   Connects to SIPREC SRS using **TLS v1.2+** with client certificate authentication.
+*   Sends SIP **INVITE** with `multipart/mixed` body (SDP & SIPREC XML metadata).
+*   Offers configurable audio codecs in SDP (e.g., PCMA/8000, PCMU/8000).
+*   Offers **SRTP** (SDES crypto attributes) or plain **RTP** based on `--srtp-encryption`.
+*   Parses the server's SDP **answer** to determine RTP/SRTP destination IP/port and required SRTP keys.
+*   Matches SDP answer media streams based on `a=label:` attributes (expects labels "1" and "2" corresponding to client offer).
+*   Streams audio from a 2-channel audio file (e.g., WAV) using separate threads for each channel.
+    *   Uses `pylibsrtp` for SRTP encryption/decryption context based on negotiated keys.
+    *   Uses `soundfile` and `numpy` for robust G.711 (PCMA/PCMU) encoding.
+*   Optionally saves the raw, *unencrypted* encoded audio payload for each stream to separate `.wav` files (requires PCMA/PCMU encoding).
 *   Handles provisional (1xx) and final (2xx+) responses to INVITE.
 *   Sends **ACK** for successful INVITE (2xx response).
-*   **Packet Capture:** Optionally captures traffic using `tshark` to a specified file.
-*   **Decryption:** Optionally attempts to inject TLS keys from `SSLKEYLOGFILE` into the capture file using `editcap` for easy Wireshark decryption.
-*   Provides detailed **debug logging**.
+*   Sends **BYE** on exit/interrupt if the INVITE established a dialog.
+*   Optional **OPTIONS** pings before INVITE.
+*   Optional **Packet Capture** using `tshark` and **TLS Decryption** using `editcap` (requires `SSLKEYLOGFILE`).
+*   Detailed debug logging (`--debug`).
 
 ## Prerequisites
 
-*   **Python 3.9 or higher.**
-*   **Client TLS Certificate:** A valid PEM-formatted TLS certificate with the **Client Authentication** Extended Key Usage (EKU) enabled.
-*   **Client Private Key:** The corresponding PEM-formatted *unencrypted* private key for the client certificate.
-*   **CA Certificate Bundle (Recommended):** PEM-formatted file containing the Certificate Authority certificates needed to verify the **server's** TLS certificate. If omitted (`--ca-file`), server verification is disabled (INSECURE).
-*   **Network Connectivity:** Ability to reach the target SRS server over TCP on the specified SIPS port (usually 5061).
-*   **(Optional, for Packet Capture)** `tshark`: The command-line utility from the Wireshark suite must be installed and in the system's PATH.
-*   **(Optional, for Packet Decryption)** `editcap`: Another command-line utility from Wireshark, also required to be in the PATH.
-*   **(Optional, for Packet Decryption)** `SSLKEYLOGFILE` environment variable must be set to a valid file path *before* running the script.
+*   **Python 3.8 or higher.**
+*   **Python Packages:** Install using pip:
+    ```bash
+    pip install pylibsrtp soundfile numpy
+    ```
+*   **Client TLS Certificate:** PEM-formatted certificate with Client Authentication EKU.
+*   **Client Private Key:** Corresponding PEM-formatted *unencrypted* private key.
+*   **CA Certificate Bundle (Recommended):** PEM file to verify the server's certificate (`--ca-file`). Omit=INSECURE.
+*   **Audio File (Optional):** A 2-channel audio file (e.g., WAV, 8kHz) if streaming is desired (`--audio-file`).
+*   **Network Connectivity:** Reachable SRS server on the specified SIPS port (e.g., 5061 TCP).
+*   **(Optional, for Capture/Decryption)** `tshark` and `editcap` (from Wireshark) in system PATH.
+*   **(Optional, for Decryption)** `SSLKEYLOGFILE` environment variable set to a writable file path *before* running the script.
 
-## Setup Instructions
+## Setup Instructions (GCP Example)
 
-These instructions guide you through setting up a suitable environment on Google Cloud Platform (GCP) and obtaining the necessary TLS certificate.
+These steps outline setting up a test environment on a Google Cloud VM.
 
-### 1. Set up a Virtual Machine
+### 1. Create VM
 
-We recommend using a small, cost-effective VM for running the client. An `e2-small` instance on GCP with the default Debian image is a good choice.
-
+Use a small Debian VM (e.g., `e2-small`).
 ```bash
-# Make sure you have gcloud CLI installed and configured
-# Replace <YOUR_PROJECT_ID> and potentially zone/region
+# Replace <YOUR_PROJECT_ID> and potentially zone
 gcloud compute instances create siprec-client-vm \
     --project=<YOUR_PROJECT_ID> \
     --zone=us-central1-a \
-    --machine-type=e2-small
-```
-
-Connect to your newly created VM via SSH:
+    --machine-type=e2-small \
+    --image-project=debian-cloud --image-family=debian-11 # Or newer
 
 gcloud compute ssh siprec-client-vm --project=<YOUR_PROJECT_ID> --zone=us-central1-a
-
-### 2. Install Dependencies
-
-Update the package list and install necessary software (Python 3, pip, Git, and Wireshark tools):
-
-```
-sudo apt update
-sudo apt upgrade -y
-sudo apt install -y python3 python3-pip git wireshark-common
 ```
 
-Note: wireshark-common provides tshark and editcap. You might be prompted about non-superusers capturing packets during installation; select the appropriate option for your security needs.
+### 2. Install Dependencies on VM
 
-If you want your user to be able to capture packages, you have to choose "yes" when prompted about capturing for non-superusers and need to add your user to the wireshark group with:
-```
-sudo usermod -a -G wireshark $USER
-```
+```bash
+sudo apt update && sudo apt upgrade -y
+# Install Python 3.8+ (usually default on Debian 11+), pip, git, Wireshark tools
+sudo apt install -y python3 python3-pip git wireshark-common tshark
+# Install required Python libraries
+pip3 install pylibsrtp soundfile numpy
 
-### 3. Obtain a Client TLS Certificate
-
-This is a crucial step. The SIPREC SRS (like Google Cloud SIP SBC) will need to trust the Certificate Authority (CA) that issued your client certificate.
-
-Requirement: The certificate MUST have the Client Authentication Extended Key Usage (EKU) OID (1.3.6.1.5.5.7.3.2).
-
-Trusted CA: Ensure the CA is trusted by your target SRS. For Google Cloud SIP SBC, refer to their documentation for the list of trusted CAs. Sectigo is a trusted CA by the Google SBC.
-
-Recommendation (Cost-Effective): PositiveSSL certificates, issued by Sectigo, are often the cheapest option that meets the requirements and is typically trusted by Google. Purchase a basic SSL certificate. During the Certificate Signing Request (CSR) generation process, ensure you specify details relevant to your client (e.g., a specific hostname or identifier for the Common Name (CN) or Subject Alternative Name (SAN)).
-
-Certificate Chain:
-
-When you receive your certificate from the CA (e.g., PositiveSSL/Sectigo), you typically get:
-
-Your Client/End-entity Certificate.
-
-One or more Intermediate CA Certificates.
-
-The Root CA Certificate (sometimes provided, sometimes assumed to be in the trust store).
-
-You need to prepare two main PEM files for the script:
-
---cert-file (e.g., client_fullchain.crt): This file MUST contain your client certificate followed by the intermediate CA certificate(s) in the correct order (client cert -> intermediate CA -> ... -> CA just below the root). Do NOT include the Root CA certificate in this file.
-
---key-file (e.g., client.key): This file MUST contain only the unencrypted private key corresponding to your client certificate. If your key is encrypted, decrypt it first (e.g., using openssl rsa).
-
-You can concatenate the certificates into the client_fullchain.crt file like this:
-
-```
-# Assuming you received your_cert.crt and intermediate_ca.crt from Sectigo
-cat your_cert.crt intermediate_ca.crt > client_fullchain.crt
+# Optional: Allow non-root tshark capture (Logout/Login may be needed after adding group)
+# sudo dpkg-reconfigure wireshark-common # Choose "Yes"
+# sudo usermod -a -G wireshark $USER
 ```
 
-Finding the Chain: Sectigo provides CA bundles. You can often find the necessary intermediates here (ensure you get the correct chain for your specific certificate type): Sectigo Support - Certificate Bundles (Link provided by user). Download the appropriate bundle and extract the intermediate(s).
+### 3. Obtain Client TLS Certificate
 
---ca-file (e.g., server_cas.pem): This file is used by the client to verify the SRS server's certificate. If you are connecting to a Google Cloud service, you would typically use the Google Trust Services CA bundle. If you omit this flag, server certificate validation is disabled (not recommended). This file is not related to the client certificate chain you present to the server.
-
-Security: Ensure your private key file (client.key) has strict permissions (chmod 400 client.key).
+*   The certificate **must** have the **Client Authentication** Extended Key Usage (EKU).
+*   The CA must be trusted by your target SRS (check SRS documentation). Sectigo (via PositiveSSL) is often a cost-effective, trusted option for Google SBCs.
+*   Prepare PEM files:
+    *   `--cert-file` (e.g., `client_fullchain.crt`): Your client cert + intermediate CA cert(s). **Do not include the Root CA.**
+        ```bash
+        # Example: Concatenate received certs
+        cat your_client_cert.crt intermediate_ca.crt > client_fullchain.crt
+        ```
+    *   `--key-file` (e.g., `client.key`): Your *unencrypted* private key. Secure it (`chmod 400`).
+    *   `--ca-file` (e.g., `server_cas.pem`): The CA bundle to verify the *server*. For Google, use their trust bundle.
 
 ### 4. Deploy the Script
 
-Clone the repository or download the siprec_client_manual_multipart.py script onto your VM:
+Clone the repository or copy the `siprec_client_streamer_pylibsrtp.py` script to the VM. Place your certificate and key files securely on the VM.
 
-```
-# Example using Git
-git clone <your-repo-url>
-cd <your-repo-directory>
-```
+## Usage
 
-Place your prepared certificate (client_fullchain.crt) and key (client.key) files, and optionally the server CA file (server_cas.pem), in a secure location accessible by the script user on the VM.
+```bash
+# Set keylog file for potential decryption BEFORE running
+export SSLKEYLOGFILE=/tmp/sslkeys.log
 
-#### Usage
-
-```
-# Run the client (use sudo if needed for packet capture on privileged interfaces)
-SSLKEYLOGFILE=/tmp/sslkeys.log python siprec_client_manual_multipart.py [OPTIONS] dest_number dest_host
+# Run the client
+python siprec_client_streamer_pylibsrtp.py [OPTIONS] dest_number dest_host
 ```
 
-#### Arguments
+### Arguments
 
-dest_number: (Required) Destination user/number part for the SIP Request-URI (e.g., +15551234567, srs_service_address).
+*   `dest_number`: (Required) Destination user/number for Request-URI (e.g., `rec-target@domain`).
+*   `dest_host`: (Required) Destination SRS hostname or IP.
+*   `-p`, `--dest-port`: Destination SIPS/TLS port (Default: 5061).
+*   `-s`, `--src-number`: (Required) Source AOR (e.g., `client@example.com`).
+*   `--src-host`: (Required) Source public IP or FQDN for Via/Contact.
+*   `--src-display-name`: Source display name (Default: "PythonSIPRECClient").
+*   `--local-port`: Local SIP source port (Default: 0 = ephemeral).
+*   `--cert-file`: (Required) Path to client cert file (PEM, with chain).
+*   `--key-file`: (Required) Path to client private key file (PEM, unencrypted).
+*   `--ca-file`: Path to CA bundle to verify server cert (PEM). Omit=INSECURE.
+*   `--audio-encoding`: Audio codec ('NAME/Rate', Default: "PCMA/8000"). Supports PCMA, PCMU, G722, G729 etc. (PCMA/PCMU needed for WAV saving).
+*   `--options-ping-count`: Number of OPTIONS pings before INVITE (Default: 0).
+*   `--options-target-uri`: Specific Request-URI for OPTIONS.
+*   `--call-info-url`: URL for `Call-Info` header.
+*   `--srtp-encryption`: SRTP profile offer (Default: `AES_CM_128_HMAC_SHA1_80`). Choices: `AES_CM_128_HMAC_SHA1_80`, `AES_CM_128_HMAC_SHA1_32`, `NONE` (for plain RTP). **Use `NONE` for Google SBCs.**
+*   `--audio-file`: Path to 2-channel audio file (e.g., WAV) for streaming. If omitted, no streaming occurs.
+*   `--packet-time`: RTP packet duration in ms (Default: 20).
+*   `--stream-duration`: Max stream duration in seconds (0 = full file / Ctrl+C).
+*   `--save-stream1-file`: Save payload for label "1" to WAV file (PCMA/PCMU only).
+*   `--save-stream2-file`: Save payload for label "2" to WAV file (PCMA/PCMU only).
+*   `-d`, `--debug`: Enable DEBUG logging.
+*   `--pcap-file`: Capture traffic to this base file (requires `tshark`). Appends `-decrypted` if `SSLKEYLOGFILE` is set and `editcap` runs.
+*   `--capture-interface`: Network interface for `tshark` (Default: `any`, often needs root).
+*   `--capture-sip-range`: IP/CIDR for SIP capture filter (Default: `74.125.88.128/25`).
+*   `--capture-sip-port`: TCP port for SIP capture filter (Default: `5672`).
+*   `--capture-media-range`: IP/CIDR for Media capture filter (Default: `74.125.39.0/24`).
 
-dest_host: (Required) Destination SIPREC SRS hostname or IP address (e.g., srs.example.com).
+## Examples
 
--p, --dest-port PORT: Destination SRS port for SIPS/TLS (Default: 5061).
+1.  **Basic Test (No Streaming, Default PCMA)**
+    ```bash
+    python siprec_client_streamer_pylibsrtp.py \
+        rec-target@srs.example.com srs.example.com \
+        --src-number sip:myclient@mydomain.com \
+        --src-host my.public.vm.ip.address \
+        --cert-file client_fullchain.crt \
+        --key-file client.key \
+        --ca-file server_cas.pem
+    ```
 
--s, --src-number AOR: (Required) Source Address-of-Record (AOR) for From/Contact headers (e.g., sip:client@yourdomain.com). Needs to be a full SIP URI like user@host.
+2.  **Stream Plain RTP (Recommended for Google SBC), Save Streams**
+    ```bash
+    # Ensure audio.wav is 2-channel, 8000 Hz
+    export SSLKEYLOGFILE=/tmp/sslkeys.log
+    python siprec_client_streamer_pylibsrtp.py \
+        rec-target@srs.google.com srs.google.com \
+        --src-number sip:client@example.com \
+        --src-host 1.2.3.4 \
+        --cert-file client.crt --key-file client.key --ca-file google_cas.pem \
+        --audio-file /path/to/audio.wav \
+        --srtp-encryption NONE \
+        --stream-duration 60 \
+        --save-stream1-file /tmp/caller_stream.wav \
+        --save-stream2-file /tmp/callee_stream.wav \
+        --pcap-file /tmp/siprec_rtp.pcapng \
+        --debug
+    ```
 
---src-host HOST_OR_IP: (Required) Source public IP or FQDN for Via/Contact host parts. Should be the address of the machine running the script.
+3.  **Stream SRTP (May Fail on Google SBC), Capture**
+    ```bash
+    # Ensure audio.wav is 2-channel, 8000 Hz
+    export SSLKEYLOGFILE=/tmp/sslkeys.log
+    python siprec_client_streamer_pylibsrtp.py \
+        rec-target@srs.example.com srs.example.com \
+        --src-number sip:tester@mydomain.com \
+        --src-host 203.0.113.50 \
+        --cert-file client.crt --key-file client.key --ca-file server_cas.pem \
+        --audio-file /path/to/audio.wav \
+        --srtp-encryption AES_CM_128_HMAC_SHA1_80 \
+        --pcap-file /tmp/siprec_srtp.pcapng \
+        --capture-interface eth0 # Use specific interface if 'any' fails
+    ```
 
---src-display-name NAME: Source display name for From/Contact (Default: "PythonSIPRECClient").
+## Streaming Details
 
---local-port PORT: Local port to bind the client socket to (Default: 0, meaning OS assigns an ephemeral port).
+*   If `--audio-file` is provided, the script expects a 2-channel audio file compatible with `soundfile` (e.g., WAV).
+*   It parses the 200 OK SDP answer, looking for media descriptions (`m=audio...`) with `a=label:1` and `a=label:2`.
+*   It extracts the destination IP, port, and SRTP parameters (if `RTP/SAVP` is negotiated and keys are parseable) for each labeled stream.
+*   Two threads are started: one streams channel 0 to the target associated with label "1", the other streams channel 1 to the target for label "2".
+*   Audio is read in chunks matching `--packet-time`, encoded using `soundfile` (to PCMA/PCMU), packetized into RTP, optionally encrypted using `pylibsrtp` (if SRTP context was created), and sent via UDP.
+*   If `--save-streamX-file` is used, the *original encoded payload* (before SRTP encryption) is written to a WAV file with the correct headers. This requires the audio encoding to be PCMA or PCMU.
 
---cert-file PATH: (Required) Path to the client TLS certificate file (PEM format, must include intermediates).
+## Packet Capture & Decryption
 
---key-file PATH: (Required) Path to the client TLS private key file (PEM format, unencrypted).
+*   `--pcap-file`: Enables capture using `tshark`. Requires `tshark` in PATH and potentially root privileges.
+*   `SSLKEYLOGFILE`: Set this environment variable *before* running the script to a writable file path. Python's `ssl` module logs keys here.
+*   `editcap`: If `SSLKEYLOGFILE` is set, `tshark` ran, and `editcap` is in PATH, the script attempts to inject the keys into the capture.
+*   Output: `<pcap-file>` (raw) and `<pcap-file-base>-decrypted.pcapng` (if key injection succeeds). Open the decrypted file in Wireshark.
 
---ca-file PATH: Path to the CA certificate bundle file for verifying the SRS server's certificate (PEM format). If omitted, server certificate validation is disabled.
+## Troubleshooting
 
---audio-encoding CODEC: Audio encoding for SDP in 'NAME/Rate' format (Default: "PCMA/8000"). Supported: PCMU, PCMA, G722, G729 (see script for exact list). Example: --audio-encoding PCMU/8000.
-
---options-ping-count NUM: Number of OPTIONS pings to send sequentially before the INVITE (Default: 0).
-
---options-target-uri URI: Specific Request-URI for OPTIONS pings (Default: Uses main dest_number@dest_host). Example: --options-target-uri sip:ping@srs.example.com.
-
---skip-options: Skip the initial implicit OPTIONS check before pings/INVITE.
-
---call-info-url URL: URL to include in the Call-Info header (e.g., for Google CCAI integration).
-
--d, --debug: Enable detailed DEBUG level logging.
-
---pcap-file PATH: Capture traffic to this base file path (e.g., /tmp/capture.pcapng). Requires tshark. If SSLKEYLOGFILE is set, also attempts to create <PATH>-decrypted.pcapng using editcap.
-
---capture-interface IFACE: Network interface for tshark capture (Default: any). Using any or specific interfaces like eth0 often requires root/administrator privileges (sudo).
-
-#### Examples
-
-1. Basic Test (PCMA/8000, No Pings, No Capture)
-
-```sh
-python siprec_client_manual_multipart.py \
-    rec-target@srs.example.com srs.example.com \
-    --src-number sip:myclient@mydomain.com \
-    --src-host my.public.vm.ip.address \
-    --cert-file /path/to/client_fullchain.crt \
-    --key-file /path/to/client.key \
-    --ca-file /path/to/server_cas.pem
-```
-
-2. Test with PCMU/8000 and 3 OPTIONS Pings
-
-```sh
-python siprec_client_manual_multipart.py \
-    +15551234567 srs.regional.example.net \
-    --src-number sip:tester-01@mycompany.com \
-    --src-host 203.0.113.10 \
-    --cert-file client_fullchain.crt \
-    --key-file client.key \
-    --ca-file server_cas.pem \
-    --audio-encoding PCMU/8000 \
-    --options-ping-count 3
-```
-
-3. Test with Packet Capture and Decryption
-
-```sh
-SSLKEYLOGFILE=tls_keys.log python siprec_client_manual_multipart.py \
-    srs-service srs.gcp.example.com \
-    --src-number sip:siprec-gw@customer.com \
-    --src-host vm-external-ip.example.net \
-    --cert-file /etc/ssl/private/client_fullchain.crt \
-    --key-file /etc/ssl/private/client.key \
-    --ca-file /etc/ssl/certs/google_trust_services.pem \
-    --call-info-url "http://example.com/calls/unique-id-123" \
-    --pcap-file /tmp/siprec_test.pcapng \
-    --capture-interface any \
-    --debug # Enable debug for more verbose output
-```
-
-After running, look for:
-
-/tmp/siprec_test.pcapng (Raw encrypted traffic)
-
-/tmp/siprec_test-decrypted.pcapng (Decrypted traffic, viewable in Wireshark if key injection succeeded)
-
-Check /home/user/tls_keys.log to ensure keys were logged.
-
-Packet Capture & Decryption
-
-The --pcap-file option enables packet capture during the script's execution.
-
-tshark: The script invokes tshark in the background to capture packets matching the destination host and port on the specified --capture-interface.
-
-Permissions: tshark often requires root privileges (sudo) to capture on interfaces like any or eth0. Ensure the user running the script (or root via sudo) has the necessary permissions.
-
-Filter: It captures traffic to/from the resolved IP address of dest_host on port --dest-port.
-
-Output: The raw capture is saved to the path specified by --pcap-file.
-
-SSLKEYLOGFILE: For decryption to work, the SSLKEYLOGFILE environment variable must be set to a valid file path before you run the Python script. Python's ssl module will automatically log the TLS session keys to this file.
-
-Permissions: Ensure the specified keylog file exists and is writable by the user running the script. Keep this file secure as it contains sensitive key material.
-
-editcap: After the SIP session completes and tshark is stopped, if SSLKEYLOGFILE was set and editcap is found in the PATH, the script attempts to run editcap to inject the keys from the log file into the raw pcap file.
-
-Output: A new file named <pcap-file-base>-decrypted.pcapng is created.
-
-Verification: Open the -decrypted.pcapng file in Wireshark. If successful, the TLS/SIP traffic should be automatically decrypted. Check Wireshark's TLS preferences (Edit -> Preferences -> Protocols -> TLS) to ensure the (Pre)-Master-Secret log filename field is clear or pointing elsewhere, allowing editcap's embedded keys to be used.
-
-### Troubleshooting
-
-Permissions Denied (tshark/pcap): Run the script with sudo if capturing on privileged interfaces (any, eth0, etc.). Ensure the output directory for --pcap-file is writable.
-
-Permissions Denied (SSLKEYLOGFILE): Ensure the path specified exists and is writable by the user running the script before execution.
-
-Certificate Verification Failed:
-
-Server cert: Ensure --ca-file points to the correct CA bundle for the SRS server, or omit it to disable verification (insecure). Check server hostname matches the certificate SAN/CN.
-
-Client cert: Ensure the SRS trusts the CA that issued your client certificate (--cert-file). Verify the --cert-file contains the full chain (Cert + Intermediates). Verify the Client Authentication EKU is present. Ensure the --key-file matches the certificate.
-
-Handshake Errors (SSL/TLS): Check TLS versions, cipher compatibility. Ensure the private key (--key-file) is not password-protected.
-
-tshark/editcap Not Found: Ensure the Wireshark suite is installed correctly and the tools are in your system's PATH (which tshark, which editcap).
-
-Connection Timeout/Refused: Verify the dest_host and dest_port are correct and reachable. Check firewalls (on the client VM, GCP network, and the SRS side) allow traffic on the destination port (e.g., TCP 5061).
-
-DNS Resolution Error: Ensure dest_host and --src-host can be resolved by the VM. Check /etc/resolv.conf.
-
-Key Injection Fails: Verify SSLKEYLOGFILE was set correctly before running, contains valid key entries, and editcap executed without errors (check script logs). Ensure the raw pcap file (--pcap-file) was created and is not empty.
+*   **SRTP Fails (Especially Google SBC):** Use `--srtp-encryption NONE`. This is a known limitation.
+*   **No Media Flows:** Check SDP negotiation in logs (`--debug`). Verify firewall rules allow UDP traffic from client's RTP ports (default `16000`, `16002`) to the server's advertised RTP/SRTP ports. Check if the server actually sent valid SDP answers.
+*   **`soundfile` Errors / `libsndfile` not found:** `soundfile` relies on the `libsndfile` C library. Install it using your system's package manager (e.g., `sudo apt install libsndfile1` on Debian/Ubuntu).
+*   **`pylibsrtp` Errors:** Ensure it's installed correctly (`pip install pylibsrtp`). It might have system dependencies (check its documentation if installation fails).
+*   **Certificate Verification Failed:** See Setup section. Check CA trust, client cert EKU, chain order, key match.
+*   **Handshake Errors (SSL/TLS):** Check TLS versions, ciphers. Ensure key is unencrypted. Use `--debug`.
+*   **Connection Timeout/Refused:** Check SRS address/port, network reachability, firewalls (TCP 5061 typically).
+*   **WAV Saving Fails:** Ensure `--audio-encoding` is `PCMA/8000` or `PCMU/8000`. Check file path permissions.
+*   **`tshark`/`editcap` Not Found/Permission Errors:** Install Wireshark tools (`wireshark-common`), ensure they're in PATH. Run with `sudo` if needed for capture interface.
+*   **Key Injection Fails:** Verify `SSLKEYLOGFILE` path/permissions, ensure it contains keys, check `editcap` logs.
