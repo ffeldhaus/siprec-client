@@ -6,7 +6,7 @@ This command-line tool is a Python client designed for testing SIPREC (Session R
 
 It establishes a TLS connection, optionally performs OPTIONS pings, sends a SIP INVITE with SDP (offering SRTP/RTP) and SIPREC metadata, handles the server's response (parsing SDP answer for media details like destination IP/port and SRTP keys), sends ACK, streams audio from a file in separate threads (one per channel, based on SDP labels), optionally saves the raw encoded streams to WAV files, sends BYE upon completion or interrupt, and closes the connection.
 
-**IMPORTANT WARNING:** Based on current testing, using SRTP (`--srtp-encryption AES_CM_128_HMAC_SHA1_80` or similar) is **known not to work reliably with Google Cloud SIP SBCs**. The negotiation may appear successful, but media does not flow correctly. Using plain **RTP** (`--srtp-encryption NONE`) is the recommended and functional approach when targeting Google Cloud SIP SBCs.
+**IMPORTANT WARNING:** Based on current testing, using SRTP with encryption `AES_CM_128_HMAC_SHA1_32` is **known not to work reliably with Google SIP SBCs**. The negotiation may appear successful, but media does not flow correctly. Using `AES_CM_128_HMAC_SHA1_32` is the recommended and functional approach when targeting Google SIP SBCs.
 
 It uses `pylibsrtp` for SRTP handling and `soundfile`+`numpy` for reliable G.711 audio encoding.
 

@@ -137,7 +137,7 @@ SIP_VERSION: str = "SIP/2.0"
 DEFAULT_SIPS_PORT: int = 5061
 DEFAULT_MAX_FORWARDS: int = 70
 VIA_BRANCH_PREFIX: str = "z9hG4bK"
-USER_AGENT: str = "PythonSIPRECStreamer/2.11" # Version number updated for refactor
+USER_AGENT: str = "PythonSIPRECStreamer/2.12" # Version number updated for SRTP fix
 DEFAULT_SDP_AUDIO_PORT_BASE: int = 16000 # Local port base for *offering*
 CRLF: str = "\r\n"
 CRLF_BYTES: bytes = b"\r\n"
@@ -311,13 +311,14 @@ def create_sdp_offer(
         audio_encoding_str: str,
         packet_time_ms: int,
         srtp_encryption_choice: str
-        ) -> str:
+        ) -> tuple[str, dict[str, tuple[str, bytes]]]:
     """
     Creates the initial SDP OFFER (client's view).
 
     Includes crypto attributes based on srtp_encryption_choice.
     Uses RTP/SAVP if encryption is chosen, RTP/AVP otherwise.
     Uses CLIENT_OFFERED_LABEL_1 and CLIENT_OFFERED_LABEL_2 for a=label.
+    Generates distinct crypto keys and distinct crypto tags for each media stream if SRTP is used.
 
     Args:
         local_ip: The local IP address to advertise in SDP.
@@ -327,7 +328,10 @@ def create_sdp_offer(
         srtp_encryption_choice: The SRTP encryption profile name or "NONE".
 
     Returns:
-        The SDP offer as a multi-line string.
+        A tuple:
+        - The SDP offer as a multi-line string.
+        - A dictionary mapping offered labels to (suite_name, raw_key_material_bytes)
+          for SRTP streams, or an empty dict if plain RTP.
 
     Raises:
         ValueError: If the SRTP encryption choice is invalid.
@@ -347,19 +351,16 @@ def create_sdp_offer(
         audio_encoding_str = DEFAULT_AUDIO_ENCODING
         encoding_name = audio_encoding_str.split('/')[0].upper()
         sample_rate = int(audio_encoding_str.split('/')[1])
-        payload_type = AUDIO_ENCODING_TO_PAYLOAD_TYPE.get(encoding_name, 8) # Default to PCMA
+        payload_type = AUDIO_ENCODING_TO_PAYLOAD_TYPE.get(encoding_name, 8)
 
-    offer_crypto_line: str | None = None
     sdp_protocol: str = "RTP/AVP" # Default to no encryption
+    client_offered_crypto_params: dict[str, tuple[str, bytes]] = {}
 
     if srtp_encryption_choice.upper() != "NONE":
         if srtp_encryption_choice not in SUPPORTED_SRTP_CIPHERS_SDES:
             logger.error(f"Unsupported SRTP encryption choice '{srtp_encryption_choice}'. Supported: {SUPPORTED_SRTP_CIPHERS_SDES}. Aborting SDP generation.")
             raise ValueError(f"Unsupported SRTP encryption choice: {srtp_encryption_choice}")
-
-        sdp_protocol = "RTP/SAVP" # Secure RTP
-        random_key_salt = base64.b64encode(os.urandom(30)).decode('ascii') # 16 byte key + 14 byte salt
-        offer_crypto_line = f"a=crypto:1 {srtp_encryption_choice} inline:{random_key_salt}"
+        sdp_protocol = "RTP/SAVP"
         logger.info(f"Offering SRTP with encryption: {srtp_encryption_choice} (Protocol: {sdp_protocol})")
     else:
         logger.info(f"Offering plain RTP (No encryption) (Protocol: {sdp_protocol})")
@@ -372,26 +373,46 @@ def create_sdp_offer(
         f"o=PythonSIPClient {int(time.time())} {int(time.time())+1} IN IP4 {local_ip}",
         "s=SIPREC Test Call Stream",
         "t=0 0",
-        # --- Media Stream 1 (Label CLIENT_OFFERED_LABEL_1) ---
+    ]
+
+    # --- Media Stream 1 (Label CLIENT_OFFERED_LABEL_1) ---
+    sdp_lines.extend([
         f"m=audio {local_port_base} {sdp_protocol} {payload_type} {DTMF_PAYLOAD_TYPE}",
         f"c=IN IP4 {local_ip}",
         f"a=label:{CLIENT_OFFERED_LABEL_1}",
-    ]
-    if offer_crypto_line:
-        sdp_lines.append(offer_crypto_line)
+    ])
+    if sdp_protocol == "RTP/SAVP":
+        raw_key_salt_bytes_1 = os.urandom(30)
+        key_salt_b64_1 = base64.b64encode(raw_key_salt_bytes_1).decode('ascii')
+        # Use crypto tag "1" for the first stream
+        offer_crypto_line_1 = f"a=crypto:1 {srtp_encryption_choice} inline:{key_salt_b64_1}"
+        sdp_lines.append(offer_crypto_line_1)
+        client_offered_crypto_params[CLIENT_OFFERED_LABEL_1] = (srtp_encryption_choice, raw_key_salt_bytes_1)
+        logger.debug(f"Client generated raw key material (len {len(raw_key_salt_bytes_1)}) with tag 1 for Label {CLIENT_OFFERED_LABEL_1}.")
+
     sdp_lines.extend([
         f"a=rtpmap:{payload_type} {encoding_name}/{sample_rate}",
         f"a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}",
         f"a=fmtp:{DTMF_PAYLOAD_TYPE} 0-15",
         "a=sendonly",
         f"a=maxptime:{packet_time_ms}",
-        # --- Media Stream 2 (Label CLIENT_OFFERED_LABEL_2) ---
+    ])
+
+    # --- Media Stream 2 (Label CLIENT_OFFERED_LABEL_2) ---
+    sdp_lines.extend([
         f"m=audio {local_port_base+2} {sdp_protocol} {payload_type} {DTMF_PAYLOAD_TYPE}",
         f"c=IN IP4 {local_ip}",
         f"a=label:{CLIENT_OFFERED_LABEL_2}",
     ])
-    if offer_crypto_line:
-        sdp_lines.append(offer_crypto_line)
+    if sdp_protocol == "RTP/SAVP":
+        raw_key_salt_bytes_2 = os.urandom(30)
+        key_salt_b64_2 = base64.b64encode(raw_key_salt_bytes_2).decode('ascii')
+        # Use crypto tag "2" for the second stream (DIFFERENT FROM PREVIOUS SUGGESTION)
+        offer_crypto_line_2 = f"a=crypto:2 {srtp_encryption_choice} inline:{key_salt_b64_2}"
+        sdp_lines.append(offer_crypto_line_2)
+        client_offered_crypto_params[CLIENT_OFFERED_LABEL_2] = (srtp_encryption_choice, raw_key_salt_bytes_2)
+        logger.debug(f"Client generated raw key material (len {len(raw_key_salt_bytes_2)}) with tag 2 for Label {CLIENT_OFFERED_LABEL_2}.")
+
     sdp_lines.extend([
         f"a=rtpmap:{payload_type} {encoding_name}/{sample_rate}",
         f"a=rtpmap:{DTMF_PAYLOAD_TYPE} telephone-event/{sample_rate}",
@@ -400,8 +421,8 @@ def create_sdp_offer(
         f"a=maxptime:{packet_time_ms}",
         "" # Add trailing empty line before joining
     ])
-
-    return CRLF.join(sdp_lines)
+    # Return the generated SDP and the client's offered crypto params
+    return CRLF.join(sdp_lines), client_offered_crypto_params
 
 
 def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
@@ -410,6 +431,7 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
 
     Handles both RTP/AVP and RTP/SAVP protocols.
     Captures the 'a=label:' attribute. Extracts crypto details if SAVP.
+    The 'crypto_key_material' here is the server's key material for its outbound stream.
 
     Args:
         sdp_body: The raw bytes of the SDP body.
@@ -463,7 +485,7 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
                             "connection_ip": global_ip, # Start with global IP
                             "label": None,
                             "crypto_suite": None,
-                            "crypto_key_material": None,
+                            "crypto_key_material": None, # This will be server's key for its outbound
                             "rtpmap": {}
                         }
                         logger.debug(f"SDP Answer: Found m= line: Port={current_media_dict['port']}, Proto={current_media_dict['protocol']}, PTs={current_media_dict['payload_types']}")
@@ -503,26 +525,26 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
                         suite = crypto_parts[1]
                         key_b64 = crypto_parts[2].split(':', 1)[1]
 
-                        if suite in SUPPORTED_SRTP_CIPHERS_SDES:
+                        if suite in SUPPORTED_SRTP_CIPHERS_SDES: # Check if client supports this suite (server selected it)
                             try:
-                                key_material = base64.b64decode(key_b64)
+                                key_material = base64.b64decode(key_b64) # This is server's key
                                 expected_len = 30 # AES_CM_128_HMAC_SHA1_* requires 16 key + 14 salt
                                 if len(key_material) == expected_len:
-                                    # Store the first valid crypto line
+                                    # Store the first valid crypto line (server's perspective)
                                     if current_media_dict.get("crypto_suite") is None:
                                         current_media_dict["crypto_suite"] = suite
-                                        current_media_dict["crypto_key_material"] = key_material
-                                        logger.info(f"SDP Answer: Parsed valid crypto for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}', Tag:{tag}): Suite={suite}, KeyLen={len(key_material)}")
+                                        current_media_dict["crypto_key_material"] = key_material # SERVER'S KEY
+                                        logger.info(f"SDP Answer: Parsed server's crypto for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}', Tag:{tag}): Suite={suite}, KeyLen={len(key_material)}")
                                     else:
                                          logger.debug(f"SDP Answer: Ignoring additional crypto line for port {current_media_dict['port']}.")
                                 else:
-                                    logger.warning(f"SDP Answer: Crypto key length mismatch for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}', Suite:{suite}). Expected {expected_len}, got {len(key_material)}. Line: {line}")
+                                    logger.warning(f"SDP Answer: Server's crypto key length mismatch for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}', Suite:{suite}). Expected {expected_len}, got {len(key_material)}. Line: {line}")
                             except (base64.binascii.Error, ValueError) as e:
-                                logger.warning(f"SDP Answer: Error decoding base64 key for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {e}. Line: {line}")
+                                logger.warning(f"SDP Answer: Error decoding server's base64 key for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {e}. Line: {line}")
                         else:
-                             logger.warning(f"SDP Answer: Server offered unsupported crypto suite for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {suite}. Line: {line}")
+                             logger.warning(f"SDP Answer: Server offered crypto suite '{suite}' for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}') which client doesn't recognize as supported (but client should have offered compatible ones). Line: {line}")
                     else:
-                        logger.warning(f"SDP Answer: Could not parse crypto line format for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {line}")
+                        logger.warning(f"SDP Answer: Could not parse server's crypto line format for port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {line}")
                 elif line.startswith("a=crypto:") and current_media_dict["protocol"] == "RTP/AVP":
                      logger.warning(f"SDP Answer: Ignoring crypto attribute for non-SAVP stream on port {current_media_dict['port']} (Label:'{current_media_dict.get('label','N/A')}'): {line}")
 
@@ -546,9 +568,11 @@ def parse_sdp_answer(sdp_body: bytes) -> list[SdpMediaInfo]:
             logger.warning(f"SDP Answer: Skipping media stream for label '{info.label}' (port is {info.port}).")
         elif not info.connection_ip:
              logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (Label:'{info.label}') (no connection IP).")
-        # If SAVP was negotiated, crypto material MUST be present and parsed correctly
-        elif is_savp and not info.crypto_key_material:
-             logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (Label:'{info.label}') (RTP/SAVP negotiated but no valid/supported crypto key found/parsed).")
+        # If SAVP was negotiated, server's crypto material MUST be present and parsed correctly for its outbound stream
+        elif is_savp and not info.crypto_key_material: # This is server's key for its outbound
+             logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (Label:'{info.label}') (RTP/SAVP negotiated by server but no valid/supported server crypto key found/parsed for its side).")
+        elif is_savp and not info.crypto_suite:
+             logger.warning(f"SDP Answer: Skipping media stream on port {info.port} (Label:'{info.label}') (RTP/SAVP negotiated by server but no crypto suite parsed for its side).")
         else:
              valid_media_info.append(info)
 
@@ -835,6 +859,9 @@ class SiprecTester:
         self.ssl_sock: ssl.SSLSocket | None = None
         self._last_branch: str = "" # Via branch of the last non-ACK/BYE request (used for ACK)
         self.last_invite_offer_sdp: str | None = None
+        # Store client's offered crypto parameters
+        self.client_offered_crypto_params  = {} # label -> (suite_name, raw_key_material)
+
         self.last_invite_response_status: int | None = None
         self.last_invite_response_headers: dict[str, Union[str, list[str]]] = {}
         self.last_invite_response_body: bytes = b''
@@ -1296,6 +1323,7 @@ class SiprecTester:
         Parses the SDP answer from a 200 OK.
         Sets `self.dialog_established = True` on successful 2xx response and To tag parsing.
         Stores response details in `self.last_invite_response_*` attributes.
+        Stores client's offered crypto parameters in `self.client_offered_crypto_params`.
 
         Returns:
             True if a 2xx final response was received and processed successfully
@@ -1306,7 +1334,8 @@ class SiprecTester:
 
         # Create SDP Offer
         try:
-            self.last_invite_offer_sdp = create_sdp_offer(
+            # Capture both SDP and client's offered crypto details
+            self.last_invite_offer_sdp, self.client_offered_crypto_params = create_sdp_offer(
                 self.local_ip,
                 DEFAULT_SDP_AUDIO_PORT_BASE,
                 self.config.audio_encoding,
@@ -1454,7 +1483,7 @@ class SiprecTester:
                 elif self.last_invite_response_sdp_info:
                      for i, info in enumerate(self.last_invite_response_sdp_info):
                          crypto_info = f"Suite={info.crypto_suite}" if info.crypto_suite else "N/A (Plain RTP)"
-                         logger.info(f"  Parsed Answer Stream {i+1}: Label='{info.label}', Target={info.connection_ip}:{info.port}, Proto={info.protocol}, Crypto={crypto_info}")
+                         logger.info(f"  Parsed Answer Stream {i+1}: Label='{info.label}', Target={info.connection_ip}:{info.port}, Proto={info.protocol}, Crypto={crypto_info} (Server's Key)")
             elif final_status == 200 and not final_body:
                  logger.warning("Received 200 OK for INVITE but no SDP body was present.")
                  if self.config.audio_file:
@@ -2242,7 +2271,7 @@ def main() -> None:
 
                     if stream_info_1 and stream_info_2:
                         logger.info("Found matching SDP streams for both labels.")
-                        # --- Initialize SRTP Sessions (if needed) based on parsed answer ---
+                        # --- Initialize SRTP Sessions (if needed) based on parsed answer and client's offer ---
                         srtp_session_1: pylibsrtp.Session | None = None
                         srtp_session_2: pylibsrtp.Session | None = None
                         try:
@@ -2251,27 +2280,56 @@ def main() -> None:
                                not stream_info_2.connection_ip or stream_info_2.port <= 0:
                                  raise ValueError("Missing required IP/Port in mapped SDP streams.")
 
-                            # Setup SRTP for stream 1 if negotiated
+                            # --- Setup SRTP for Stream 1 (Label CLIENT_OFFERED_LABEL_1) ---
                             if stream_info_1.protocol == "RTP/SAVP":
-                                if stream_info_1.crypto_suite and stream_info_1.crypto_key_material:
-                                    profile = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(stream_info_1.crypto_suite)
-                                    if profile is None: raise ValueError(f"Unsupported SRTP suite '{stream_info_1.crypto_suite}' for label {CLIENT_OFFERED_LABEL_1}")
-                                    policy = pylibsrtp.Policy(key=stream_info_1.crypto_key_material, ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND, srtp_profile=profile)
-                                    srtp_session_1 = pylibsrtp.Session(policy=policy)
-                                    logger.info(f"Using SRTP for Stream 1 (Label {CLIENT_OFFERED_LABEL_1}, Suite: {stream_info_1.crypto_suite})")
-                                else: raise ValueError(f"SAVP negotiated for label {CLIENT_OFFERED_LABEL_1} but missing crypto details.")
-                            else: logger.info(f"Using plain RTP for Stream 1 (Label {CLIENT_OFFERED_LABEL_1})")
+                                server_selected_suite_1 = stream_info_1.crypto_suite
+                                # Get client's *originally offered* raw key material for this label
+                                _client_offered_suite_name_1, client_raw_key_material_1 = \
+                                    client.client_offered_crypto_params.get(CLIENT_OFFERED_LABEL_1, (None, None))
 
-                            # Setup SRTP for stream 2 if negotiated
+                                if not server_selected_suite_1:
+                                    raise ValueError(f"SAVP negotiated for Stream 1 (Label {CLIENT_OFFERED_LABEL_1}), but server's SDP answer missing crypto suite.")
+                                if not client_raw_key_material_1:
+                                    raise ValueError(f"SAVP negotiated for Stream 1 (Label {CLIENT_OFFERED_LABEL_1}), but client's offered key material for this label not found. (Ensure srtp-encryption was not NONE).")
+
+                                profile_1 = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(server_selected_suite_1)
+                                if profile_1 is None:
+                                    raise ValueError(f"Server selected unsupported SRTP suite '{server_selected_suite_1}' for Stream 1 (Label {CLIENT_OFFERED_LABEL_1}).")
+
+                                # Use CLIENT'S KEY and SERVER'S AGREED SUITE for client's outbound stream
+                                policy_1 = pylibsrtp.Policy(key=client_raw_key_material_1,
+                                                            ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND,
+                                                            srtp_profile=profile_1)
+                                srtp_session_1 = pylibsrtp.Session(policy=policy_1)
+                                logger.info(f"Using SRTP for Stream 1 (Label {CLIENT_OFFERED_LABEL_1}): Client Key, Server Suite: {server_selected_suite_1}")
+                            else:
+                                logger.info(f"Using plain RTP for Stream 1 (Label {CLIENT_OFFERED_LABEL_1})")
+
+
+                            # --- Setup SRTP for Stream 2 (Label CLIENT_OFFERED_LABEL_2) ---
                             if stream_info_2.protocol == "RTP/SAVP":
-                                if stream_info_2.crypto_suite and stream_info_2.crypto_key_material:
-                                     profile = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(stream_info_2.crypto_suite)
-                                     if profile is None: raise ValueError(f"Unsupported SRTP suite '{stream_info_2.crypto_suite}' for label {CLIENT_OFFERED_LABEL_2}")
-                                     policy = pylibsrtp.Policy(key=stream_info_2.crypto_key_material, ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND, srtp_profile=profile)
-                                     srtp_session_2 = pylibsrtp.Session(policy=policy)
-                                     logger.info(f"Using SRTP for Stream 2 (Label {CLIENT_OFFERED_LABEL_2}, Suite: {stream_info_2.crypto_suite})")
-                                else: raise ValueError(f"SAVP negotiated for label {CLIENT_OFFERED_LABEL_2} but missing crypto details.")
-                            else: logger.info(f"Using plain RTP for Stream 2 (Label {CLIENT_OFFERED_LABEL_2})")
+                                server_selected_suite_2 = stream_info_2.crypto_suite
+                                # Get client's *originally offered* raw key material for this label
+                                _client_offered_suite_name_2, client_raw_key_material_2 = \
+                                    client.client_offered_crypto_params.get(CLIENT_OFFERED_LABEL_2, (None, None))
+
+                                if not server_selected_suite_2:
+                                    raise ValueError(f"SAVP negotiated for Stream 2 (Label {CLIENT_OFFERED_LABEL_2}), but server's SDP answer missing crypto suite.")
+                                if not client_raw_key_material_2:
+                                    raise ValueError(f"SAVP negotiated for Stream 2 (Label {CLIENT_OFFERED_LABEL_2}), but client's offered key material for this label not found. (Ensure srtp-encryption was not NONE).")
+
+                                profile_2 = SDP_SUITE_TO_PYLIBSRTP_PROFILE.get(server_selected_suite_2)
+                                if profile_2 is None:
+                                    raise ValueError(f"Server selected unsupported SRTP suite '{server_selected_suite_2}' for Stream 2 (Label {CLIENT_OFFERED_LABEL_2}).")
+
+                                # Use CLIENT'S KEY and SERVER'S AGREED SUITE for client's outbound stream
+                                policy_2 = pylibsrtp.Policy(key=client_raw_key_material_2,
+                                                            ssrc_type=pylibsrtp.Policy.SSRC_ANY_OUTBOUND,
+                                                            srtp_profile=profile_2)
+                                srtp_session_2 = pylibsrtp.Session(policy=policy_2)
+                                logger.info(f"Using SRTP for Stream 2 (Label {CLIENT_OFFERED_LABEL_2}): Client Key, Server Suite: {server_selected_suite_2}")
+                            else:
+                                logger.info(f"Using plain RTP for Stream 2 (Label {CLIENT_OFFERED_LABEL_2})")
 
                             # Common stream parameters from config/validation
                             codec_name, rate_str = args.audio_encoding.split('/')
@@ -2406,8 +2464,8 @@ def main() -> None:
                 logger.error(f"Error stopping tshark: {e}")
             finally:
                  time.sleep(0.5) # Allow filesystem flush
-                 if os.path.exists(args.pcap_file): logger.info(f"Raw packet capture in '{args.pcap_file}'")
-                 else: logger.warning(f"Pcap file '{args.pcap_file}' not found after capture.")
+                 if args.pcap_file and os.path.exists(args.pcap_file): logger.info(f"Raw packet capture in '{args.pcap_file}'")
+                 elif args.pcap_file: logger.warning(f"Pcap file '{args.pcap_file}' not found after capture.")
         elif tshark_process: # Process existed but already terminated
             logger.warning(f"tshark process (PID: {tshark_process.pid}) already terminated before cleanup (exit code: {tshark_process.returncode}). Capture might be incomplete.")
 
@@ -2416,12 +2474,14 @@ def main() -> None:
              # Generate decrypted filename only if needed
              base, ext = os.path.splitext(args.pcap_file)
              pcap_decrypted_file = f"{base}-decrypted{ext or '.pcapng'}"
-             if os.path.exists(ssl_key_log_file_path):
+             if os.path.exists(ssl_key_log_file_path) and os.path.exists(args.pcap_file):
                  _run_editcap(args.pcap_file, ssl_key_log_file_path, pcap_decrypted_file)
-             else:
+             elif not os.path.exists(ssl_key_log_file_path):
                  logger.warning(f"SSLKEYLOGFILE '{ssl_key_log_file_path}' not found. Skipping key injection.")
+             # else: pcap_file itself doesn't exist, logged by tshark section
         elif args.pcap_file and args.srtp_encryption != "NONE" and not ssl_key_log_file_path:
              logger.info("SRTP used but SSLKEYLOGFILE not set, skipping key injection.")
+
 
         logger.info(f"SIPREC client finished with exit code {exit_code}.")
         sys.exit(exit_code)
