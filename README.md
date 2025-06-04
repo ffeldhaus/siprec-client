@@ -1,4 +1,4 @@
-# Python SIPREC TLS Test Client with SRTP/RTP Streaming
+# Python SIPREC Test Client with Audio Streaming
 
 ## Description
 
